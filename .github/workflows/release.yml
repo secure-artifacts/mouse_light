@@ -24,7 +24,7 @@ jobs:
         shell: cmd
         run: |
           mkdir dist
-          cl /nologo /EHsc /O2 /std:c++17 /DUNICODE /D_UNICODE MouseRipple.cpp /link /SUBSYSTEM:WINDOWS gdiplus.lib user32.lib gdi32.lib shell32.lib comctl32.lib comdlg32.lib advapi32.lib /OUT:dist\mouse_light.exe
+          cl /nologo /utf-8 /EHsc /O2 /std:c++17 /DUNICODE /D_UNICODE MouseRipple.cpp /link /SUBSYSTEM:WINDOWS gdiplus.lib user32.lib gdi32.lib shell32.lib comctl32.lib comdlg32.lib advapi32.lib /OUT:dist\mouse_light.exe
           copy MouseRipple.ini dist\MouseRipple.ini
           copy README.md dist\README.md
           copy LICENSE dist\LICENSE

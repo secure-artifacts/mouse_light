@@ -26,7 +26,7 @@ if errorlevel 1 (
 )
 
 taskkill /f /im MouseRipple.exe >nul 2>nul
-cl /nologo /EHsc /O2 /std:c++17 /DUNICODE /D_UNICODE MouseRipple.cpp /link /SUBSYSTEM:WINDOWS gdiplus.lib user32.lib gdi32.lib shell32.lib comctl32.lib comdlg32.lib advapi32.lib /OUT:MouseRipple.exe
+cl /nologo /utf-8 /EHsc /O2 /std:c++17 /DUNICODE /D_UNICODE MouseRipple.cpp /link /SUBSYSTEM:WINDOWS gdiplus.lib user32.lib gdi32.lib shell32.lib comctl32.lib comdlg32.lib advapi32.lib /OUT:MouseRipple.exe
 if errorlevel 1 (
   echo.
   echo Build failed.

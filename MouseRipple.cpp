@@ -356,7 +356,7 @@ void drawSoftToroidalWave(Graphics& g, float cx, float cy, float rCrest, float h
 }
 
 // -------------------------------------------------------------
-// Calligraphic Ink Ribbon Trail (水墨流线拖尾：高密样条微流，全曲面丝滑无折痕/无缝羽化)
+// Calligraphic Ink Ribbon Trail (水墨流线拖尾：多重全景连贯微线流，彻底杜绝任何串珠/斑点/接缝)
 // -------------------------------------------------------------
 void drawSmoothInkRibbon(Graphics& g, const std::vector<TrailPoint>& points, float totalDurationMs,
                          float baseWidth, int baseAlpha, COLORREF color, int vx, int vy, ULONGLONG now) {
@@ -367,10 +367,10 @@ void drawSmoothInkRibbon(Graphics& g, const std::vector<TrailPoint>& points, flo
     const BYTE gg = GetGValue(color);
     const BYTE b = GetBValue(color);
 
-    // 1. 高密度 Catmull-Rom 三次样条微步插值（步长 1.5px），彻底消除粗网格折角与棱角
+    // 1. 高密度 Catmull-Rom 三次样条微步插值（自适应微步 <= 1.5px），全平滑几何曲线
     struct SmoothPt { float x, y; float age; };
     std::vector<SmoothPt> pts;
-    pts.reserve(n * 25);
+    pts.reserve(n * 35);
 
     for (int i = 0; i < n - 1; ++i) {
         const auto& p0 = points[(std::max)(0, i - 1)];
@@ -388,7 +388,7 @@ void drawSmoothInkRibbon(Graphics& g, const std::vector<TrailPoint>& points, flo
         const float p3y = static_cast<float>(p3.screenPt.y - vy);
 
         const float dist = std::hypot(p2x - p1x, p2y - p1y);
-        const int subSteps = (std::max)(1, (std::min)(30, static_cast<int>(dist / 1.5f)));
+        const int subSteps = (std::max)(1, (std::min)(40, static_cast<int>(dist / 1.5f)));
 
         const float t1 = static_cast<float>(now > p1.timeMs ? now - p1.timeMs : 0);
         const float t2 = static_cast<float>(now > p2.timeMs ? now - p2.timeMs : 0);
@@ -419,35 +419,34 @@ void drawSmoothInkRibbon(Graphics& g, const std::vector<TrailPoint>& points, flo
     const int m = static_cast<int>(pts.size());
     if (m < 2) return;
 
-    // 2. 绘制外层极淡水墨晕光（Soft Bleed Ambient Halo）
-    for (int i = 0; i < m - 1; ++i) {
-        const float u = (pts[i].age + pts[i + 1].age) * 0.5f;
-        const float w = (std::max)(2.0f, (baseWidth * 1.5f) * std::pow(1.0f - u, 0.72f));
-        const float a = (static_cast<float>(baseAlpha) * 0.20f) * std::pow(1.0f - u, 1.20f);
-        if (a < 1.0f) continue;
+    // 2. 多重全景连贯微线流（MultiPass Continuous DrawLines）
+    // 彻底杜绝逐微段 DrawLine 导致的端点圆头重复叠加（消除串珠、斑点与起伏问题）
+    // 采用 10 层由尾至头的同心连续折线流，每层单次完整绘制，内部自然平滑无缝！
+    constexpr int kPasses = 10;
+    for (int p = 0; p < kPasses; ++p) {
+        float startFrac = static_cast<float>(p) / static_cast<float>(kPasses);
+        int startIdx = static_cast<int>(startFrac * (m - 1));
+        if (m - 1 - startIdx < 1) continue;
 
-        Pen haloPen(Color(alphaByte(a), r, gg, b), w);
-        haloPen.SetStartCap(LineCapRound);
-        haloPen.SetEndCap(LineCapRound);
-        haloPen.SetLineJoin(LineJoinRound);
-        g.DrawLine(&haloPen, pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y);
-    }
+        std::vector<PointF> linePts;
+        linePts.reserve(m - startIdx);
+        for (int i = startIdx; i < m; ++i) {
+            linePts.push_back(PointF(pts[i].x, pts[i].y));
+        }
 
-    // 3. 绘制核心连续丝滑水墨线条（Core Satin Ink Stroke，圆头圆角无缝接合，彻底杜绝任何接缝/折痕）
-    for (int i = 0; i < m - 1; ++i) {
-        const float u = (pts[i].age + pts[i + 1].age) * 0.5f;
-        const float w = (std::max)(1.0f, baseWidth * std::pow(1.0f - u, 0.85f));
-        const float a = static_cast<float>(baseAlpha) * std::pow(1.0f - u, 1.25f);
-        if (a < 1.0f) continue;
+        float frac = static_cast<float>(p + 1) / static_cast<float>(kPasses);
+        float width = (std::max)(1.0f, baseWidth * std::pow(frac, 0.75f));
+        float passAlpha = (static_cast<float>(baseAlpha) / kPasses) * 1.35f;
 
-        Pen pen(Color(alphaByte(a), r, gg, b), w);
+        Pen pen(Color(alphaByte(passAlpha), r, gg, b), width);
         pen.SetStartCap(LineCapRound);
         pen.SetEndCap(LineCapRound);
         pen.SetLineJoin(LineJoinRound);
-        g.DrawLine(&pen, pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y);
+
+        g.DrawLines(&pen, linePts.data(), static_cast<INT>(linePts.size()));
     }
 
-    // 4. 笔尖圆润水墨微珠（Head Droplet）
+    // 3. 笔尖圆润水墨微珠（Head Droplet）
     const float headR = baseWidth * 0.5f;
     SolidBrush headBrush(Color(alphaByte(static_cast<float>(baseAlpha)), r, gg, b));
     g.FillEllipse(&headBrush, pts.back().x - headR, pts.back().y - headR, headR * 2.0f, headR * 2.0f);

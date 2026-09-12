@@ -1,0 +1,28 @@
+# Build artifacts
+*.obj
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.manifest
+!MouseRipple.exe.manifest
+
+# Directories
+dist/
+build/
+bin/
+out/
+.vs/
+.vscode/
+.idea/
+x64/
+x86/
+Debug/
+Release/
+
+# Scratch & temporary testing files
+scratch/
+*.tmp
+*.log

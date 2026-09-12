@@ -356,7 +356,7 @@ void drawSoftToroidalWave(Graphics& g, float cx, float cy, float rCrest, float h
 }
 
 // -------------------------------------------------------------
-// Calligraphic Ink Ribbon Trail (水墨流线拖尾：多重全景连贯微线流，彻底杜绝任何串珠/斑点/接缝)
+// Calligraphic Ink Ribbon Trail (水墨流线拖尾：单体闭合曲面流，彻底杜绝阶梯/串珠/断折)
 // -------------------------------------------------------------
 void drawSmoothInkRibbon(Graphics& g, const std::vector<TrailPoint>& points, float totalDurationMs,
                          float baseWidth, int baseAlpha, COLORREF color, int vx, int vy, ULONGLONG now) {
@@ -367,89 +367,131 @@ void drawSmoothInkRibbon(Graphics& g, const std::vector<TrailPoint>& points, flo
     const BYTE gg = GetGValue(color);
     const BYTE b = GetBValue(color);
 
-    // 1. 高密度 Catmull-Rom 三次样条微步插值（自适应微步 <= 1.5px），全平滑几何曲线
-    struct SmoothPt { float x, y; float age; };
-    std::vector<SmoothPt> pts;
-    pts.reserve(n * 35);
+    // 1. 坐标转换与点位存活度计算
+    struct PtT { float x, y; float life; };
+    std::vector<PtT> rawPts(n);
+    for (int i = 0; i < n; ++i) {
+        rawPts[i].x = static_cast<float>(points[i].screenPt.x - vx);
+        rawPts[i].y = static_cast<float>(points[i].screenPt.y - vy);
+        float elapsed = static_cast<float>(now > points[i].timeMs ? now - points[i].timeMs : 0);
+        rawPts[i].life = clamp01(1.0f - elapsed / totalDurationMs);
+    }
+
+    // 2. 向心样条曲线插值（自适应步长 + 端点自然切线外推，杜绝快速划动末端僵直折线）
+    std::vector<PtT> spline;
+    spline.reserve(n * 40);
 
     for (int i = 0; i < n - 1; ++i) {
-        const auto& p0 = points[(std::max)(0, i - 1)];
-        const auto& p1 = points[i];
-        const auto& p2 = points[i + 1];
-        const auto& p3 = points[(std::min)(n - 1, i + 2)];
+        PtT p0, p1, p2, p3;
+        p1 = rawPts[i];
+        p2 = rawPts[i + 1];
 
-        const float p1x = static_cast<float>(p1.screenPt.x - vx);
-        const float p1y = static_cast<float>(p1.screenPt.y - vy);
-        const float p2x = static_cast<float>(p2.screenPt.x - vx);
-        const float p2y = static_cast<float>(p2.screenPt.y - vy);
-        const float p0x = static_cast<float>(p0.screenPt.x - vx);
-        const float p0y = static_cast<float>(p0.screenPt.y - vy);
-        const float p3x = static_cast<float>(p3.screenPt.x - vx);
-        const float p3y = static_cast<float>(p3.screenPt.y - vy);
+        // 端点自然外推，避免一头一尾切线被强制锁定为直弦
+        if (i == 0) {
+            p0.x = p1.x - (p2.x - p1.x);
+            p0.y = p1.y - (p2.y - p1.y);
+            p0.life = clamp01(p1.life + (p1.life - p2.life));
+        } else {
+            p0 = rawPts[i - 1];
+        }
 
-        const float dist = std::hypot(p2x - p1x, p2y - p1y);
-        const int subSteps = (std::max)(1, (std::min)(40, static_cast<int>(dist / 1.5f)));
+        if (i + 2 < n) {
+            p3 = rawPts[i + 2];
+        } else {
+            p3.x = p2.x + (p2.x - p1.x);
+            p3.y = p2.y + (p2.y - p1.y);
+            p3.life = clamp01(p2.life - (p1.life - p2.life));
+        }
 
-        const float t1 = static_cast<float>(now > p1.timeMs ? now - p1.timeMs : 0);
-        const float t2 = static_cast<float>(now > p2.timeMs ? now - p2.timeMs : 0);
+        const float dist = std::hypot(p2.x - p1.x, p2.y - p1.y);
+        const int steps = (std::max)(4, (std::min)(50, static_cast<int>(dist / 1.5f)));
 
-        for (int step = 0; step < subSteps; ++step) {
-            const float s = static_cast<float>(step) / static_cast<float>(subSteps);
-            const float s2 = s * s;
-            const float s3 = s2 * s;
+        for (int s = 0; s < steps; ++s) {
+            const float u = static_cast<float>(s) / static_cast<float>(steps);
+            const float u2 = u * u;
+            const float u3 = u2 * u;
 
-            const float x = 0.5f * ((2.0f * p1x) +
-                                  (-p0x + p2x) * s +
-                                  (2.0f * p0x - 5.0f * p1x + 4.0f * p2x - p3x) * s2 +
-                                  (-p0x + 3.0f * p1x - 3.0f * p2x + p3x) * s3);
+            const float x = 0.5f * ((2.0f * p1.x) +
+                                  (-p0.x + p2.x) * u +
+                                  (2.0f * p0.x - 5.0f * p1.x + 4.0f * p2.x - p3.x) * u2 +
+                                  (-p0.x + 3.0f * p1.x - 3.0f * p2.x + p3.x) * u3);
 
-            const float y = 0.5f * ((2.0f * p1y) +
-                                  (-p0y + p2y) * s +
-                                  (2.0f * p0y - 5.0f * p1y + 4.0f * p2y - p3y) * s2 +
-                                  (-p0y + 3.0f * p1y - 3.0f * p2y + p3y) * s3);
+            const float y = 0.5f * ((2.0f * p1.y) +
+                                  (-p0.y + p2.y) * u +
+                                  (2.0f * p0.y - 5.0f * p1.y + 4.0f * p2.y - p3.y) * u2 +
+                                  (-p0.y + 3.0f * p1.y - 3.0f * p2.y + p3.y) * u3);
 
-            const float timeVal = t1 + (t2 - t1) * s;
-            pts.push_back({x, y, clamp01(timeVal / totalDurationMs)});
+            const float life = p1.life + (p2.life - p1.life) * u;
+            spline.push_back({x, y, clamp01(life)});
         }
     }
-    const auto& lastP = points.back();
-    const float lastAge = static_cast<float>(now > lastP.timeMs ? now - lastP.timeMs : 0) / totalDurationMs;
-    pts.push_back({static_cast<float>(lastP.screenPt.x - vx), static_cast<float>(lastP.screenPt.y - vy), clamp01(lastAge)});
+    spline.push_back(rawPts.back());
 
-    const int m = static_cast<int>(pts.size());
+    const int m = static_cast<int>(spline.size());
     if (m < 2) return;
 
-    // 2. 多重全景连贯微线流（MultiPass Continuous DrawLines）
-    // 彻底杜绝逐微段 DrawLine 导致的端点圆头重复叠加（消除串珠、斑点与起伏问题）
-    // 采用 10 层由尾至头的同心连续折线流，每层单次完整绘制，内部自然平滑无缝！
-    constexpr int kPasses = 10;
-    for (int p = 0; p < kPasses; ++p) {
-        float startFrac = static_cast<float>(p) / static_cast<float>(kPasses);
-        int startIdx = static_cast<int>(startFrac * (m - 1));
-        if (m - 1 - startIdx < 1) continue;
+    // 3. 计算连续无阶梯法向轮廓左右边界（宽度纯数学无级衰减，完全消灭阶梯跳变与毛发细尾）
+    std::vector<PointF> leftEdge(m);
+    std::vector<PointF> rightEdge(m);
 
-        std::vector<PointF> linePts;
-        linePts.reserve(m - startIdx);
-        for (int i = startIdx; i < m; ++i) {
-            linePts.push_back(PointF(pts[i].x, pts[i].y));
+    for (int i = 0; i < m; ++i) {
+        float dx = 0.0f, dy = 0.0f;
+        if (i == 0) {
+            dx = spline[1].x - spline[0].x;
+            dy = spline[1].y - spline[0].y;
+        } else if (i == m - 1) {
+            dx = spline[m - 1].x - spline[m - 2].x;
+            dy = spline[m - 1].y - spline[m - 2].y;
+        } else {
+            dx = spline[i + 1].x - spline[i - 1].x;
+            dy = spline[i + 1].y - spline[i - 1].y;
         }
 
-        float frac = static_cast<float>(p + 1) / static_cast<float>(kPasses);
-        float width = (std::max)(1.0f, baseWidth * std::pow(frac, 0.75f));
-        float passAlpha = (static_cast<float>(baseAlpha) / kPasses) * 1.35f;
+        const float len = std::hypot(dx, dy);
+        float nx = 0.0f, ny = 0.0f;
+        if (len > 0.001f) {
+            nx = -dy / len;
+            ny = dx / len;
+        }
 
-        Pen pen(Color(alphaByte(passAlpha), r, gg, b), width);
-        pen.SetStartCap(LineCapRound);
-        pen.SetEndCap(LineCapRound);
-        pen.SetLineJoin(LineJoinRound);
+        // 半线宽随存活度无级衰减：尾部收于 0.3px 锋尖，头部丰满
+        float hw = (baseWidth * 0.5f) * std::pow(spline[i].life, 0.70f);
+        if (hw < 0.3f) hw = 0.3f;
 
-        g.DrawLines(&pen, linePts.data(), static_cast<INT>(linePts.size()));
+        leftEdge[i]  = PointF(spline[i].x + nx * hw, spline[i].y + ny * hw);
+        rightEdge[i] = PointF(spline[i].x - nx * hw, spline[i].y - ny * hw);
     }
 
-    // 3. 笔尖圆润水墨微珠（Head Droplet）
-    const float headR = baseWidth * 0.5f;
-    SolidBrush headBrush(Color(alphaByte(static_cast<float>(baseAlpha)), r, gg, b));
-    g.FillEllipse(&headBrush, pts.back().x - headR, pts.back().y - headR, headR * 2.0f, headR * 2.0f);
+    // 4. 构建单体闭合曲面图形路径（FillModeWinding，自相交时平滑实体融合，无孔洞）
+    GraphicsPath path;
+    path.SetFillMode(FillModeWinding);
+
+    // 左边缘从尾到头
+    path.AddLines(leftEdge.data(), m);
+
+    // 头部圆润弧线接合（笔尖）
+    const auto& headPt = spline.back();
+    const float headR = (baseWidth * 0.5f) * std::pow(headPt.life, 0.70f);
+    if (headR > 0.5f) {
+        float angleL = std::atan2(leftEdge[m - 1].Y - headPt.y, leftEdge[m - 1].X - headPt.x) * 180.0f / 3.14159265f;
+        path.AddArc(headPt.x - headR, headPt.y - headR, headR * 2.0f, headR * 2.0f, angleL, -180.0f);
+    }
+
+    // 右边缘从头回尾
+    std::vector<PointF> revRight(m);
+    for (int i = 0; i < m; ++i) revRight[i] = rightEdge[m - 1 - i];
+    path.AddLines(revRight.data(), m);
+
+    // 闭合路径至尾端锋尖
+    path.CloseFigure();
+
+    // 5. 单次渲染光栅化（零阶梯跳变、零内部端帽重叠、零串珠、浑然一体）
+    const float effectiveAlpha = static_cast<float>(baseAlpha) * std::pow(headPt.life, 0.35f);
+    SolidBrush brush(Color(alphaByte(effectiveAlpha), r, gg, b));
+    g.FillPath(&brush, &path);
+
+    Pen contourPen(Color(alphaByte(effectiveAlpha), r, gg, b), 1.0f);
+    g.DrawPath(&contourPen, &path);
 }
 
 // -------------------------------------------------------------

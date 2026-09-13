@@ -17,6 +17,7 @@
 #include <cmath>
 #include <string>
 #include <sstream>
+#include <iomanip>
 #include "resource.h"
 
 #pragma comment(lib, "gdiplus.lib")
@@ -79,6 +80,13 @@ constexpr int IDC_TRK_TRAIL_WIDTH     = 2030;
 constexpr int IDC_LBL_TRAIL_WIDTH     = 2031;
 constexpr int IDC_TRK_TRAIL_ALPHA     = 2032;
 constexpr int IDC_LBL_TRAIL_ALPHA     = 2033;
+constexpr int IDC_CHK_ANNOTATION      = 2034;
+constexpr int IDC_BTN_COLOR_INK       = 2035;
+constexpr int IDC_BTN_COLOR_ARROW     = 2036;
+constexpr int IDC_TRK_INK_WIDTH       = 2037;
+constexpr int IDC_LBL_INK_WIDTH       = 2038;
+constexpr int IDC_TRK_ANNOTATION_HOLD = 2039;
+constexpr int IDC_LBL_ANNOTATION_HOLD = 2040;
 
 enum StylePreset {
     PRESET_WACOM = 0,
@@ -114,6 +122,14 @@ struct AppConfig {
     int trailWidth = 8;                        // 笔触最大粗细 3 - 18px
     int trailAlphaPercent = 80;                // 透明度 10% - 100%
     int trailAlpha = 204;                      // 255 * 80% ≈ 204
+
+    // Teaching annotation settings (教学演示标注: 阅后即焚画笔与快捷箭头)
+    bool annotationEnabled = true;             // 默认开启（按住 Ctrl+Alt 唤起）
+    COLORREF inkColor = RGB(255, 68, 68);      // 醒目教学红橙色
+    int inkWidth = 6;                          // 画笔粗细 (3 - 16px)
+    COLORREF arrowColor = RGB(255, 140, 0);    // 亮橙金箭头
+    int arrowWidth = 6;                        // 箭头粗细 (3 - 16px)
+    int annotationHoldMs = 2200;               // 停留展示时长 (500 - 5000ms)
 };
 
 AppConfig g_config;
@@ -129,6 +145,30 @@ struct TrailPoint {
     POINT screenPt{};
     double timeMs = 0.0;
 };
+
+enum AnnotationType {
+    ANNOTATION_INK = 0,
+    ANNOTATION_ARROW = 1
+};
+
+struct AnnotationStroke {
+    AnnotationType type = ANNOTATION_INK;
+    std::vector<POINT> points;  // Path points (for ink)
+    POINT startPt{};            // For arrow
+    POINT endPt{};              // For arrow
+    bool isDrawing = true;      // actively drawing with button down
+    double startedAt = 0.0;
+    double releasedAt = 0.0;
+    COLORREF color = RGB(255, 68, 68);
+    float width = 6.0f;
+    float holdMs = 2200.0f;
+    float fadeMs = 800.0f;
+};
+
+std::vector<AnnotationStroke> g_annotations;
+bool g_isDrawingInk = false;
+bool g_isDrawingArrow = false;
+HHOOK g_kbdHook = nullptr;
 
 inline double getHighPrecisionMs() {
     static const double invFreq = []() {
@@ -209,6 +249,14 @@ void loadConfig() {
     g_config.trailWidth = GetPrivateProfileIntW(L"Config", L"TrailWidth", 8, ini.c_str());
     g_config.trailAlphaPercent = (std::max)(10, (std::min)(100, (int)GetPrivateProfileIntW(L"Config", L"TrailAlphaPercent", 80, ini.c_str())));
     g_config.trailAlpha = static_cast<int>(255.0f * (g_config.trailAlphaPercent / 100.0f));
+
+    // Teaching Annotations configuration (教学演示标注)
+    g_config.annotationEnabled = GetPrivateProfileIntW(L"Config", L"AnnotationEnabled", 1, ini.c_str()) != 0;
+    g_config.inkColor = (COLORREF)GetPrivateProfileIntW(L"Config", L"InkColor", RGB(255, 68, 68), ini.c_str());
+    g_config.inkWidth = (std::max)(3, (std::min)(16, (int)GetPrivateProfileIntW(L"Config", L"InkWidth", 6, ini.c_str())));
+    g_config.arrowColor = (COLORREF)GetPrivateProfileIntW(L"Config", L"ArrowColor", RGB(255, 140, 0), ini.c_str());
+    g_config.arrowWidth = (std::max)(3, (std::min)(16, (int)GetPrivateProfileIntW(L"Config", L"ArrowWidth", 6, ini.c_str())));
+    g_config.annotationHoldMs = (std::max)(500, (std::min)(6000, (int)GetPrivateProfileIntW(L"Config", L"AnnotationHoldMs", 2200, ini.c_str())));
 }
 
 void saveConfig() {
@@ -238,6 +286,14 @@ void saveConfig() {
     WritePrivateProfileStringW(L"Config", L"TrailDurationMs", std::to_wstring(g_config.trailDurationMs).c_str(), ini.c_str());
     WritePrivateProfileStringW(L"Config", L"TrailWidth", std::to_wstring(g_config.trailWidth).c_str(), ini.c_str());
     WritePrivateProfileStringW(L"Config", L"TrailAlphaPercent", std::to_wstring(g_config.trailAlphaPercent).c_str(), ini.c_str());
+
+    // Teaching Annotations save
+    WritePrivateProfileStringW(L"Config", L"AnnotationEnabled", g_config.annotationEnabled ? L"1" : L"0", ini.c_str());
+    WritePrivateProfileStringW(L"Config", L"InkColor", std::to_wstring(g_config.inkColor).c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Config", L"InkWidth", std::to_wstring(g_config.inkWidth).c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Config", L"ArrowColor", std::to_wstring(g_config.arrowColor).c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Config", L"ArrowWidth", std::to_wstring(g_config.arrowWidth).c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Config", L"AnnotationHoldMs", std::to_wstring(g_config.annotationHoldMs).c_str(), ini.c_str());
 }
 
 void applyPreset(int preset) {
@@ -612,6 +668,147 @@ void drawSmoothInkRibbon(Graphics& g, const std::vector<TrailPoint>& points, flo
 }
 
 // -------------------------------------------------------------
+// Teaching Annotations Drawing (阅后即焚流光画笔与快捷箭头)
+// -------------------------------------------------------------
+void drawAnnotationInk(Graphics& g, const AnnotationStroke& stroke, double nowMs, int originX, int originY) {
+    if (stroke.points.empty()) return;
+
+    float alpha = 1.0f;
+    if (!stroke.isDrawing) {
+        const double elapsed = nowMs - stroke.releasedAt;
+        if (elapsed < stroke.holdMs) {
+            alpha = 1.0f;
+        } else {
+            const double fadeElapsed = elapsed - stroke.holdMs;
+            if (fadeElapsed >= stroke.fadeMs) {
+                return;
+            }
+            float t = static_cast<float>(fadeElapsed / stroke.fadeMs);
+            alpha = 1.0f - std::pow(t, 1.4f);
+        }
+    }
+
+    if (alpha <= 0.005f) return;
+
+    const BYTE r = GetRValue(stroke.color);
+    const BYTE gg = GetGValue(stroke.color);
+    const BYTE b = GetBValue(stroke.color);
+
+    std::vector<PointF> pts;
+    pts.reserve(stroke.points.size());
+    for (const auto& p : stroke.points) {
+        pts.emplace_back(static_cast<float>(p.x - originX), static_cast<float>(p.y - originY));
+    }
+
+    if (pts.size() == 1) {
+        float rad = stroke.width * 0.5f;
+        SolidBrush brush(Color(alphaByte(alpha * 240.0f), r, gg, b));
+        g.FillEllipse(&brush, pts[0].X - rad, pts[0].Y - rad, rad * 2.0f, rad * 2.0f);
+        return;
+    }
+
+    // 1. Soft dark drop shadow pass (ensures high contrast on any background)
+    Pen shadowPen(Color(alphaByte(alpha * 85.0f), 0, 0, 0), stroke.width + 3.0f);
+    shadowPen.SetStartCap(LineCapRound);
+    shadowPen.SetEndCap(LineCapRound);
+    shadowPen.SetLineJoin(LineJoinRound);
+    g.DrawCurve(&shadowPen, pts.data(), static_cast<INT>(pts.size()), 0.5f);
+
+    // 2. Vibrant core ink pass
+    Pen corePen(Color(alphaByte(alpha * 250.0f), r, gg, b), stroke.width);
+    corePen.SetStartCap(LineCapRound);
+    corePen.SetEndCap(LineCapRound);
+    corePen.SetLineJoin(LineJoinRound);
+    g.DrawCurve(&corePen, pts.data(), static_cast<INT>(pts.size()), 0.5f);
+}
+
+void drawQuickArrow(Graphics& g, const AnnotationStroke& stroke, double nowMs, int originX, int originY) {
+    float alpha = 1.0f;
+    if (!stroke.isDrawing) {
+        const double elapsed = nowMs - stroke.releasedAt;
+        if (elapsed < stroke.holdMs) {
+            alpha = 1.0f;
+        } else {
+            const double fadeElapsed = elapsed - stroke.holdMs;
+            if (fadeElapsed >= stroke.fadeMs) {
+                return;
+            }
+            float t = static_cast<float>(fadeElapsed / stroke.fadeMs);
+            alpha = 1.0f - std::pow(t, 1.4f);
+        }
+    }
+
+    if (alpha <= 0.005f) return;
+
+    const float x1 = static_cast<float>(stroke.startPt.x - originX);
+    const float y1 = static_cast<float>(stroke.startPt.y - originY);
+    const float x2 = static_cast<float>(stroke.endPt.x - originX);
+    const float y2 = static_cast<float>(stroke.endPt.y - originY);
+
+    const float dx = x2 - x1;
+    const float dy = y2 - y1;
+    const float dist = std::hypot(dx, dy);
+    if (dist < 4.0f) {
+        const BYTE r = GetRValue(stroke.color);
+        const BYTE gg = GetGValue(stroke.color);
+        const BYTE b = GetBValue(stroke.color);
+        SolidBrush brush(Color(alphaByte(alpha * 240.0f), r, gg, b));
+        float rad = stroke.width * 0.6f;
+        g.FillEllipse(&brush, x1 - rad, y1 - rad, rad * 2.0f, rad * 2.0f);
+        return;
+    }
+
+    const float ux = dx / dist;
+    const float uy = dy / dist;
+    const float nx = -uy;
+    const float ny = ux;
+
+    float headLen = (std::min)(50.0f, (std::max)(22.0f, stroke.width * 4.0f));
+    if (dist < headLen * 1.3f) {
+        headLen = dist * 0.72f;
+    }
+    const float headWidth = headLen * 0.80f;
+
+    PointF tip(x2, y2);
+    PointF left(x2 - ux * headLen + nx * (headWidth * 0.5f),
+                y2 - uy * headLen + ny * (headWidth * 0.5f));
+    PointF right(x2 - ux * headLen - nx * (headWidth * 0.5f),
+                 y2 - uy * headLen - ny * (headWidth * 0.5f));
+    PointF notch(x2 - ux * (headLen * 0.72f),
+                 y2 - uy * (headLen * 0.72f));
+
+    PointF headPoly[4] = { tip, left, notch, right };
+
+    const BYTE r = GetRValue(stroke.color);
+    const BYTE gg = GetGValue(stroke.color);
+    const BYTE b = GetBValue(stroke.color);
+
+    // 1. Soft dark shadow pass
+    Pen shadowShaft(Color(alphaByte(alpha * 85.0f), 0, 0, 0), stroke.width + 3.0f);
+    shadowShaft.SetStartCap(LineCapRound);
+    shadowShaft.SetEndCap(LineCapRound);
+    g.DrawLine(&shadowShaft, x1, y1, notch.X, notch.Y);
+
+    Pen shadowHeadBorder(Color(alphaByte(alpha * 85.0f), 0, 0, 0), 3.0f);
+    shadowHeadBorder.SetLineJoin(LineJoinRound);
+    SolidBrush shadowBrush(Color(alphaByte(alpha * 85.0f), 0, 0, 0));
+    g.FillPolygon(&shadowBrush, headPoly, 4);
+    g.DrawPolygon(&shadowHeadBorder, headPoly, 4);
+
+    // 2. Vibrant core pass
+    Pen coreShaft(Color(alphaByte(alpha * 250.0f), r, gg, b), stroke.width);
+    coreShaft.SetStartCap(LineCapRound);
+    coreShaft.SetEndCap(LineCapRound);
+    g.DrawLine(&coreShaft, x1, y1, notch.X, notch.Y);
+
+    SolidBrush coreBrush(Color(alphaByte(alpha * 250.0f), r, gg, b));
+    g.FillPolygon(&coreBrush, headPoly, 4);
+    Pen coreHeadBorder(Color(alphaByte(alpha * 250.0f), r, gg, b), 1.5f);
+    coreHeadBorder.SetLineJoin(LineJoinRound);
+    g.DrawPolygon(&coreHeadBorder, headPoly, 4);
+}
+
+// -------------------------------------------------------------
 // Ambient Continuous Ripple Animation (常驻单圈纯净线条呼吸圈，无渐变过度)
 // -------------------------------------------------------------
 void drawAmbientRipple(Graphics& g, ULONGLONG now) {
@@ -793,6 +990,15 @@ void renderOverlay(HWND hwnd) {
         for (const auto& ripple : g_ripples) {
             drawRipple(graphics, ripple, now);
         }
+
+        // 4. Draw teaching annotations (Live ink brush & quick arrows)
+        for (const auto& stroke : g_annotations) {
+            if (stroke.type == ANNOTATION_INK) {
+                drawAnnotationInk(graphics, stroke, nowMs, g_virtualX, g_virtualY);
+            } else if (stroke.type == ANNOTATION_ARROW) {
+                drawQuickArrow(graphics, stroke, nowMs, g_virtualX, g_virtualY);
+            }
+        }
     }
 
     POINT dst{g_virtualX, g_virtualY};
@@ -825,9 +1031,99 @@ void addRipple(POINT screenPt, int buttonType) {
 
 LRESULT CALLBACK lowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && g_overlay) {
+        const auto* info = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+        const bool isCtrlAlt = ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) &&
+                               ((GetAsyncKeyState(VK_MENU) & 0x8000) != 0);
+
+        if (g_config.annotationEnabled) {
+            // 1. Start ink drawing with Ctrl+Alt + Left Button Down
+            if (wParam == WM_LBUTTONDOWN && isCtrlAlt) {
+                g_isDrawingInk = true;
+                AnnotationStroke s;
+                s.type = ANNOTATION_INK;
+                s.points.push_back(info->pt);
+                s.isDrawing = true;
+                s.startedAt = getHighPrecisionMs();
+                s.color = g_config.inkColor;
+                s.width = static_cast<float>(g_config.inkWidth);
+                s.holdMs = static_cast<float>(g_config.annotationHoldMs);
+                s.fadeMs = 800.0f;
+                g_annotations.push_back(s);
+                renderOverlay(g_overlay);
+                return 1; // Intercept: do not click underlying apps or desktop
+            }
+
+            // 2. Start arrow drawing with Ctrl+Alt + Right Button Down
+            if (wParam == WM_RBUTTONDOWN && isCtrlAlt) {
+                g_isDrawingArrow = true;
+                AnnotationStroke s;
+                s.type = ANNOTATION_ARROW;
+                s.startPt = info->pt;
+                s.endPt = info->pt;
+                s.isDrawing = true;
+                s.startedAt = getHighPrecisionMs();
+                s.color = g_config.arrowColor;
+                s.width = static_cast<float>(g_config.arrowWidth);
+                s.holdMs = static_cast<float>(g_config.annotationHoldMs);
+                s.fadeMs = 800.0f;
+                g_annotations.push_back(s);
+                renderOverlay(g_overlay);
+                return 1; // Intercept: do not show context menu
+            }
+
+            // 3. Mouse move while drawing
+            if (wParam == WM_MOUSEMOVE) {
+                if (g_isDrawingInk && !g_annotations.empty()) {
+                    auto& s = g_annotations.back();
+                    if (s.points.empty()) {
+                        s.points.push_back(info->pt);
+                        renderOverlay(g_overlay);
+                    } else {
+                        const auto& last = s.points.back();
+                        const int dx = info->pt.x - last.x;
+                        const int dy = info->pt.y - last.y;
+                        if (dx * dx + dy * dy >= 4) { // At least 2px move
+                            s.points.push_back(info->pt);
+                            renderOverlay(g_overlay);
+                        }
+                    }
+                    return 1; // Intercept while drawing ink
+                }
+
+                if (g_isDrawingArrow && !g_annotations.empty()) {
+                    auto& s = g_annotations.back();
+                    s.endPt = info->pt;
+                    renderOverlay(g_overlay);
+                    return 1; // Intercept while drawing arrow
+                }
+            }
+
+            // 4. Mouse button up finishes drawing and triggers auto-fade countdown
+            if (wParam == WM_LBUTTONUP && g_isDrawingInk) {
+                g_isDrawingInk = false;
+                if (!g_annotations.empty()) {
+                    auto& s = g_annotations.back();
+                    s.isDrawing = false;
+                    s.releasedAt = getHighPrecisionMs();
+                }
+                renderOverlay(g_overlay);
+                return 1; // Intercept
+            }
+
+            if (wParam == WM_RBUTTONUP && g_isDrawingArrow) {
+                g_isDrawingArrow = false;
+                if (!g_annotations.empty()) {
+                    auto& s = g_annotations.back();
+                    s.isDrawing = false;
+                    s.releasedAt = getHighPrecisionMs();
+                }
+                renderOverlay(g_overlay);
+                return 1; // Intercept
+            }
+        }
+
         if (wParam == WM_MOUSEMOVE) {
             if (g_config.trailEnabled) {
-                const auto* info = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
                 const double nowMs = getHighPrecisionMs();
                 if (g_trailPoints.empty()) {
                     g_trailPoints.push_back({info->pt, nowMs});
@@ -850,13 +1146,31 @@ LRESULT CALLBACK lowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam) {
             else if (wParam == WM_MBUTTONDOWN) btn = 2;
 
             if (btn >= 0) {
-                const auto* info = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
                 POINT* p = new POINT(info->pt);
                 PostMessage(g_overlay, WM_RIPPLE_CLICK, static_cast<WPARAM>(btn), reinterpret_cast<LPARAM>(p));
             }
         }
     }
     return CallNextHookEx(g_mouseHook, code, wParam, lParam);
+}
+
+LRESULT CALLBACK lowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION) {
+        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+            const auto* kbd = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+            if (kbd->vkCode == VK_ESCAPE) {
+                if (!g_annotations.empty() || g_isDrawingInk || g_isDrawingArrow) {
+                    g_annotations.clear();
+                    g_isDrawingInk = false;
+                    g_isDrawingArrow = false;
+                    if (g_overlay) {
+                        renderOverlay(g_overlay);
+                    }
+                }
+            }
+        }
+    }
+    return CallNextHookEx(g_kbdHook, code, wParam, lParam);
 }
 
 void addTrayIcon(HWND hwnd) {
@@ -975,6 +1289,16 @@ void updateSettingsLabels(HWND hwnd) {
     if (g_config.trailAlphaPercent <= 40) ssTA << L" (淡雅水墨)";
     else if (g_config.trailAlphaPercent >= 80) ssTA << L" (饱满醒目)";
     SetDlgItemTextW(hwnd, IDC_LBL_TRAIL_ALPHA, ssTA.str().c_str());
+
+    // Teaching annotation labels
+    std::wostringstream ssIW;
+    ssIW << L"标注线条粗细: " << g_config.inkWidth << L" px";
+    SetDlgItemTextW(hwnd, IDC_LBL_INK_WIDTH, ssIW.str().c_str());
+
+    std::wostringstream ssAH;
+    ssAH << L"停留展示时长: " << g_config.annotationHoldMs << L" ms ("
+         << std::fixed << std::setprecision(1) << (g_config.annotationHoldMs / 1000.0f) << L" 秒后自动淡出)";
+    SetDlgItemTextW(hwnd, IDC_LBL_ANNOTATION_HOLD, ssAH.str().c_str());
 }
 
 void syncSettingsControls(HWND hwnd) {
@@ -1002,6 +1326,11 @@ void syncSettingsControls(HWND hwnd) {
     SendDlgItemMessageW(hwnd, IDC_TRK_TRAIL_WIDTH, TBM_SETPOS, TRUE, g_config.trailWidth);
     SendDlgItemMessageW(hwnd, IDC_TRK_TRAIL_ALPHA, TBM_SETPOS, TRUE, g_config.trailAlphaPercent);
 
+    // Teaching annotations controls sync
+    CheckDlgButton(hwnd, IDC_CHK_ANNOTATION, g_config.annotationEnabled ? BST_CHECKED : BST_UNCHECKED);
+    SendDlgItemMessageW(hwnd, IDC_TRK_INK_WIDTH, TBM_SETPOS, TRUE, g_config.inkWidth);
+    SendDlgItemMessageW(hwnd, IDC_TRK_ANNOTATION_HOLD, TBM_SETPOS, TRUE, g_config.annotationHoldMs);
+
     updateSettingsLabels(hwnd);
 
     // Invalidate color preview buttons
@@ -1010,6 +1339,8 @@ void syncSettingsControls(HWND hwnd) {
     InvalidateRect(GetDlgItem(hwnd, IDC_BTN_COLOR_MID), nullptr, TRUE);
     InvalidateRect(GetDlgItem(hwnd, IDC_BTN_COLOR_AMBIENT), nullptr, TRUE);
     InvalidateRect(GetDlgItem(hwnd, IDC_BTN_COLOR_TRAIL), nullptr, TRUE);
+    InvalidateRect(GetDlgItem(hwnd, IDC_BTN_COLOR_INK), nullptr, TRUE);
+    InvalidateRect(GetDlgItem(hwnd, IDC_BTN_COLOR_ARROW), nullptr, TRUE);
 }
 
 bool pickColor(HWND owner, COLORREF& targetColor) {
@@ -1037,189 +1368,231 @@ LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             g_uiFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
         }
 
+        // ==========================================
+        // LEFT COLUMN (x = 15..405, w = 390)
+        // ==========================================
+
         // 1. Preset GroupBox
         CreateWindowExW(0, L"BUTTON", L" 预设风格 (Preset Style) ",
                         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                        15, 10, 440, 58, hwnd, nullptr, g_instance, nullptr);
+                        15, 10, 390, 58, hwnd, nullptr, g_instance, nullptr);
 
         HWND hCombo = CreateWindowExW(0, L"COMBOBOX", L"",
                                       WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
-                                      30, 30, 410, 150, hwnd, (HMENU)(INT_PTR)IDC_PRESET_COMBO, g_instance, nullptr);
-        SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"✨ Wacom 细腻笔触风格 (推荐: 小巧/灵动/微点触感)");
-        SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"🌊 经典水波涟漪风格 (较大半径/多层扩散/悠长)");
+                                      30, 30, 360, 150, hwnd, (HMENU)(INT_PTR)IDC_PRESET_COMBO, g_instance, nullptr);
+        SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"✨ Wacom 细腻笔触风格 (推荐: 小巧/灵动/触点)");
+        SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"🌊 经典水波涟漪风格 (大半径/多层扩散/悠长)");
         SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"🛠️ 自定义参数 (自由调节)");
 
-        // 2. Color GroupBox
-        CreateWindowExW(0, L"BUTTON", L" 点击波纹颜色 (点击色块选色) ",
+        // 2. Click Ripples GroupBox
+        CreateWindowExW(0, L"BUTTON", L" 点击波纹色彩与动态 ",
                         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                        15, 74, 440, 78, hwnd, nullptr, g_instance, nullptr);
+                        15, 74, 390, 258, hwnd, nullptr, g_instance, nullptr);
 
-        CreateWindowExW(0, L"STATIC", L"左键颜色:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        30, 94, 65, 20, hwnd, nullptr, g_instance, nullptr);
+        CreateWindowExW(0, L"STATIC", L"左键:", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        30, 94, 38, 20, hwnd, nullptr, g_instance, nullptr);
         CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                        98, 92, 40, 24, hwnd, (HMENU)(INT_PTR)IDC_BTN_COLOR_LEFT, g_instance, nullptr);
+                        70, 92, 36, 22, hwnd, (HMENU)(INT_PTR)IDC_BTN_COLOR_LEFT, g_instance, nullptr);
 
-        CreateWindowExW(0, L"STATIC", L"右键颜色:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        170, 94, 65, 20, hwnd, nullptr, g_instance, nullptr);
+        CreateWindowExW(0, L"STATIC", L"右键:", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        130, 94, 38, 20, hwnd, nullptr, g_instance, nullptr);
         CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                        238, 92, 40, 24, hwnd, (HMENU)(INT_PTR)IDC_BTN_COLOR_RIGHT, g_instance, nullptr);
+                        170, 92, 36, 22, hwnd, (HMENU)(INT_PTR)IDC_BTN_COLOR_RIGHT, g_instance, nullptr);
 
-        CreateWindowExW(0, L"STATIC", L"中键颜色:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        310, 94, 65, 20, hwnd, nullptr, g_instance, nullptr);
+        CreateWindowExW(0, L"STATIC", L"中键:", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        230, 94, 38, 20, hwnd, nullptr, g_instance, nullptr);
         CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                        378, 92, 40, 24, hwnd, (HMENU)(INT_PTR)IDC_BTN_COLOR_MID, g_instance, nullptr);
-
-        CreateWindowExW(0, L"STATIC", L"支持任意 Windows 自定义调色，各自独立配色",
-                        WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        30, 124, 410, 18, hwnd, nullptr, g_instance, nullptr);
-
-        // 3. Parameters GroupBox
-        CreateWindowExW(0, L"BUTTON", L" 点击波纹细腻度调节 ",
-                        WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                        15, 158, 440, 222, hwnd, nullptr, g_instance, nullptr);
+                        270, 92, 36, 22, hwnd, (HMENU)(INT_PTR)IDC_BTN_COLOR_MID, g_instance, nullptr);
 
         // Max Radius Trackbar (15 - 90 px)
         CreateWindowExW(0, L"STATIC", L"最大半径:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        30, 178, 220, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_RADIUS, g_instance, nullptr);
+                        30, 120, 220, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_RADIUS, g_instance, nullptr);
         HWND hTrkRadius = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
                                           WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ | WS_TABSTOP,
-                                          25, 196, 420, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_RADIUS, g_instance, nullptr);
+                                          25, 138, 365, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_RADIUS, g_instance, nullptr);
         SendMessageW(hTrkRadius, TBM_SETRANGE, TRUE, MAKELPARAM(15, 90));
         SendMessageW(hTrkRadius, TBM_SETTICFREQ, 5, 0);
 
         // Duration Trackbar (150 - 750 ms)
         CreateWindowExW(0, L"STATIC", L"动画时长:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        30, 226, 220, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_DURATION, g_instance, nullptr);
+                        30, 168, 220, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_DURATION, g_instance, nullptr);
         HWND hTrkDuration = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
                                             WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ | WS_TABSTOP,
-                                            25, 244, 420, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_DURATION, g_instance, nullptr);
+                                            25, 186, 365, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_DURATION, g_instance, nullptr);
         SendMessageW(hTrkDuration, TBM_SETRANGE, TRUE, MAKELPARAM(150, 750));
         SendMessageW(hTrkDuration, TBM_SETTICFREQ, 50, 0);
 
         // Thickness Trackbar (1 - 5 px)
         CreateWindowExW(0, L"STATIC", L"线条粗细:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        30, 274, 200, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_THICKNESS, g_instance, nullptr);
+                        30, 216, 170, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_THICKNESS, g_instance, nullptr);
         HWND hTrkThickness = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
                                              WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ | WS_TABSTOP,
-                                             25, 292, 195, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_THICKNESS, g_instance, nullptr);
+                                             25, 234, 175, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_THICKNESS, g_instance, nullptr);
         SendMessageW(hTrkThickness, TBM_SETRANGE, TRUE, MAKELPARAM(1, 5));
 
         // Rings Trackbar (1 - 3)
         CreateWindowExW(0, L"STATIC", L"波纹圈数:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        245, 274, 195, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_RINGS, g_instance, nullptr);
+                        215, 216, 170, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_RINGS, g_instance, nullptr);
         HWND hTrkRings = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
                                          WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ | WS_TABSTOP,
-                                         240, 292, 205, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_RINGS, g_instance, nullptr);
+                                         210, 234, 180, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_RINGS, g_instance, nullptr);
         SendMessageW(hTrkRings, TBM_SETRANGE, TRUE, MAKELPARAM(1, 3));
 
         // Click Ripple Opacity Trackbar (10 - 100 %)
         CreateWindowExW(0, L"STATIC", L"波纹透明度:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        30, 324, 195, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_ALPHA, g_instance, nullptr);
+                        30, 264, 170, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_ALPHA, g_instance, nullptr);
         HWND hTrkAlpha = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
                                          WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ | WS_TABSTOP,
-                                         25, 342, 195, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_ALPHA, g_instance, nullptr);
+                                         25, 282, 175, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_ALPHA, g_instance, nullptr);
         SendMessageW(hTrkAlpha, TBM_SETRANGE, TRUE, MAKELPARAM(10, 100));
         SendMessageW(hTrkAlpha, TBM_SETTICFREQ, 10, 0);
 
         // Center dot checkbox (落笔触感微点)
         CreateWindowExW(0, L"BUTTON", L"开启落笔触点 (Wacom)",
                         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
-                        240, 344, 205, 24, hwnd, (HMENU)(INT_PTR)IDC_CHK_CENTERDOT, g_instance, nullptr);
+                        215, 284, 180, 24, hwnd, (HMENU)(INT_PTR)IDC_CHK_CENTERDOT, g_instance, nullptr);
 
-        // 4. Ambient Continuous Ripple GroupBox (常驻鼠标动态线条圈)
-        CreateWindowExW(0, L"BUTTON", L" 常驻鼠标动态线条圈 (单圈纯净呼吸 / 0-100%透明度) ",
+        // 3. Ambient Continuous Ripple GroupBox (常驻鼠标动态线条圈)
+        CreateWindowExW(0, L"BUTTON", L" 常驻鼠标动态线条圈 (单圈纯净呼吸) ",
                         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                        15, 386, 440, 158, hwnd, nullptr, g_instance, nullptr);
+                        15, 338, 390, 200, hwnd, nullptr, g_instance, nullptr);
 
-        CreateWindowExW(0, L"BUTTON", L"开启常驻动态线条 (跟随鼠标单圈呼吸)",
+        CreateWindowExW(0, L"BUTTON", L"开启常驻动态线条圈",
                         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
-                        30, 406, 280, 22, hwnd, (HMENU)(INT_PTR)IDC_CHK_AMBIENT, g_instance, nullptr);
+                        30, 358, 260, 22, hwnd, (HMENU)(INT_PTR)IDC_CHK_AMBIENT, g_instance, nullptr);
 
-        // Ambient Color Setting
         CreateWindowExW(0, L"STATIC", L"颜色:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        320, 408, 38, 20, hwnd, nullptr, g_instance, nullptr);
+                        300, 360, 38, 20, hwnd, nullptr, g_instance, nullptr);
         CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                        360, 405, 42, 22, hwnd, (HMENU)(INT_PTR)IDC_BTN_COLOR_AMBIENT, g_instance, nullptr);
+                        340, 358, 38, 22, hwnd, (HMENU)(INT_PTR)IDC_BTN_COLOR_AMBIENT, g_instance, nullptr);
 
-        // Radius & Alpha (0 - 100%)
         CreateWindowExW(0, L"STATIC", L"常驻线条半径:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        30, 432, 200, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_AMBIENT_RADIUS, g_instance, nullptr);
+                        30, 384, 170, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_AMBIENT_RADIUS, g_instance, nullptr);
         HWND hTrkAmbientR = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
                                             WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ | WS_TABSTOP,
-                                            25, 450, 195, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_AMBIENT_RADIUS, g_instance, nullptr);
+                                            25, 402, 175, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_AMBIENT_RADIUS, g_instance, nullptr);
         SendMessageW(hTrkAmbientR, TBM_SETRANGE, TRUE, MAKELPARAM(10, 45));
         SendMessageW(hTrkAmbientR, TBM_SETTICFREQ, 5, 0);
 
         CreateWindowExW(0, L"STATIC", L"常驻透明度:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        245, 432, 195, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_AMBIENT_ALPHA, g_instance, nullptr);
+                        215, 384, 170, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_AMBIENT_ALPHA, g_instance, nullptr);
         HWND hTrkAmbientA = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
                                             WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ | WS_TABSTOP,
-                                            240, 450, 205, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_AMBIENT_ALPHA, g_instance, nullptr);
+                                            210, 402, 180, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_AMBIENT_ALPHA, g_instance, nullptr);
         SendMessageW(hTrkAmbientA, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
         SendMessageW(hTrkAmbientA, TBM_SETTICFREQ, 10, 0);
 
-        // Line Thickness (1 - 6 px)
         CreateWindowExW(0, L"STATIC", L"常驻线条粗细:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        30, 482, 380, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_AMBIENT_BAND, g_instance, nullptr);
+                        30, 434, 360, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_AMBIENT_BAND, g_instance, nullptr);
         HWND hTrkAmbientB = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
                                             WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ | WS_TABSTOP,
-                                            25, 502, 420, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_AMBIENT_BAND, g_instance, nullptr);
+                                            25, 452, 365, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_AMBIENT_BAND, g_instance, nullptr);
         SendMessageW(hTrkAmbientB, TBM_SETRANGE, TRUE, MAKELPARAM(1, 6));
         SendMessageW(hTrkAmbientB, TBM_SETTICFREQ, 1, 0);
 
-        // 5. Ink Ribbon Trail GroupBox (鼠标移动水墨流线拖尾)
-        CreateWindowExW(0, L"BUTTON", L" 鼠标移动水墨流线拖尾 (书法笔触 / 颜色可调) ",
+        CreateWindowExW(0, L"STATIC", L"💡 常驻线条单圈纯净呼吸，透明度可调至0%完全隐藏",
+                        WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        28, 488, 365, 36, hwnd, nullptr, g_instance, nullptr);
+
+        // ==========================================
+        // RIGHT COLUMN (x = 420..810, w = 390)
+        // ==========================================
+
+        // 4. Ink Ribbon Trail GroupBox (鼠标移动水墨流线拖尾)
+        CreateWindowExW(0, L"BUTTON", L" 鼠标移动水墨流线拖尾 (书法笔触) ",
                         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                        15, 550, 440, 176, hwnd, nullptr, g_instance, nullptr);
+                        420, 10, 390, 224, hwnd, nullptr, g_instance, nullptr);
 
-        CreateWindowExW(0, L"BUTTON", L"开启水墨流线拖尾 (移动时光滑丝带渐隐)",
+        CreateWindowExW(0, L"BUTTON", L"开启水墨流线拖尾 (移动渐隐)",
                         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
-                        30, 570, 280, 22, hwnd, (HMENU)(INT_PTR)IDC_CHK_TRAIL, g_instance, nullptr);
+                        435, 30, 260, 22, hwnd, (HMENU)(INT_PTR)IDC_CHK_TRAIL, g_instance, nullptr);
 
-        // Trail Color Setting
         CreateWindowExW(0, L"STATIC", L"颜色:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        320, 572, 38, 20, hwnd, nullptr, g_instance, nullptr);
+                        705, 32, 38, 20, hwnd, nullptr, g_instance, nullptr);
         CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                        360, 569, 42, 22, hwnd, (HMENU)(INT_PTR)IDC_BTN_COLOR_TRAIL, g_instance, nullptr);
+                        745, 30, 38, 22, hwnd, (HMENU)(INT_PTR)IDC_BTN_COLOR_TRAIL, g_instance, nullptr);
 
-        // Trail Duration Trackbar (150 - 800 ms)
         CreateWindowExW(0, L"STATIC", L"拖尾留存:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        30, 596, 380, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_TRAIL_DURATION, g_instance, nullptr);
+                        435, 56, 360, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_TRAIL_DURATION, g_instance, nullptr);
         HWND hTrkTrailD = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
                                           WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ | WS_TABSTOP,
-                                          25, 614, 420, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_TRAIL_DURATION, g_instance, nullptr);
+                                          430, 74, 365, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_TRAIL_DURATION, g_instance, nullptr);
         SendMessageW(hTrkTrailD, TBM_SETRANGE, TRUE, MAKELPARAM(150, 800));
         SendMessageW(hTrkTrailD, TBM_SETTICFREQ, 50, 0);
 
-        // Trail Width (3 - 18 px) & Alpha (10 - 100 %)
         CreateWindowExW(0, L"STATIC", L"拖尾粗细:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        30, 646, 200, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_TRAIL_WIDTH, g_instance, nullptr);
+                        435, 104, 170, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_TRAIL_WIDTH, g_instance, nullptr);
         HWND hTrkTrailW = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
                                           WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ | WS_TABSTOP,
-                                          25, 664, 195, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_TRAIL_WIDTH, g_instance, nullptr);
+                                          430, 122, 175, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_TRAIL_WIDTH, g_instance, nullptr);
         SendMessageW(hTrkTrailW, TBM_SETRANGE, TRUE, MAKELPARAM(3, 18));
         SendMessageW(hTrkTrailW, TBM_SETTICFREQ, 2, 0);
 
         CreateWindowExW(0, L"STATIC", L"拖尾透明度:", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        245, 646, 195, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_TRAIL_ALPHA, g_instance, nullptr);
+                        620, 104, 170, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_TRAIL_ALPHA, g_instance, nullptr);
         HWND hTrkTrailA = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
                                           WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ | WS_TABSTOP,
-                                          240, 664, 205, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_TRAIL_ALPHA, g_instance, nullptr);
+                                          615, 122, 180, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_TRAIL_ALPHA, g_instance, nullptr);
         SendMessageW(hTrkTrailA, TBM_SETRANGE, TRUE, MAKELPARAM(10, 100));
         SendMessageW(hTrkTrailA, TBM_SETTICFREQ, 10, 0);
 
-        CreateWindowExW(0, L"STATIC", L"💡 如同书法水墨流畅挥毫，头部圆润、尾部渐细羽化、自然消散",
+        CreateWindowExW(0, L"STATIC", L"💡 如同书法水墨流畅挥毫，头部饱满、尾部渐细羽化、自然消散",
                         WS_CHILD | WS_VISIBLE | SS_LEFT,
-                        25, 698, 430, 18, hwnd, nullptr, g_instance, nullptr);
+                        435, 168, 365, 36, hwnd, nullptr, g_instance, nullptr);
 
-        // 6. Action Buttons
+        // 5. Teaching Annotations GroupBox (教学演示标注)
+        CreateWindowExW(0, L"BUTTON", L" 教学演示标注 (阅后即焚画笔与快捷箭头) ",
+                        WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                        420, 240, 390, 298, hwnd, nullptr, g_instance, nullptr);
+
+        CreateWindowExW(0, L"BUTTON", L"开启教学演示标注 (Ctrl+Alt 唤起)",
+                        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+                        435, 260, 350, 22, hwnd, (HMENU)(INT_PTR)IDC_CHK_ANNOTATION, g_instance, nullptr);
+
+        CreateWindowExW(0, L"STATIC", L"画笔颜色:", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        435, 288, 62, 20, hwnd, nullptr, g_instance, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                        498, 286, 38, 22, hwnd, (HMENU)(INT_PTR)IDC_BTN_COLOR_INK, g_instance, nullptr);
+
+        CreateWindowExW(0, L"STATIC", L"箭头颜色:", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        570, 288, 62, 20, hwnd, nullptr, g_instance, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                        633, 286, 38, 22, hwnd, (HMENU)(INT_PTR)IDC_BTN_COLOR_ARROW, g_instance, nullptr);
+
+        CreateWindowExW(0, L"STATIC", L"标注线条粗细:", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        435, 314, 360, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_INK_WIDTH, g_instance, nullptr);
+        HWND hTrkInkWidth = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
+                                            WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ | WS_TABSTOP,
+                                            430, 332, 365, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_INK_WIDTH, g_instance, nullptr);
+        SendMessageW(hTrkInkWidth, TBM_SETRANGE, TRUE, MAKELPARAM(3, 16));
+        SendMessageW(hTrkInkWidth, TBM_SETTICFREQ, 1, 0);
+
+        CreateWindowExW(0, L"STATIC", L"停留展示时长:", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        435, 364, 360, 18, hwnd, (HMENU)(INT_PTR)IDC_LBL_ANNOTATION_HOLD, g_instance, nullptr);
+        HWND hTrkAnnotationHold = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
+                                                  WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ | WS_TABSTOP,
+                                                  430, 382, 365, 28, hwnd, (HMENU)(INT_PTR)IDC_TRK_ANNOTATION_HOLD, g_instance, nullptr);
+        SendMessageW(hTrkAnnotationHold, TBM_SETRANGE, TRUE, MAKELPARAM(500, 5000));
+        SendMessageW(hTrkAnnotationHold, TBM_SETTICFREQ, 500, 0);
+
+        CreateWindowExW(0, L"STATIC",
+                        L"✏️ Ctrl+Alt + 鼠标左键拖拽：自由流光画笔\n"
+                        L"➡️ Ctrl+Alt + 鼠标右键拖拽：快捷箭头指引\n"
+                        L"⚡ 按 Esc 键：立即清除屏幕全部标注\n"
+                        L"🔥 停留数秒后自动平滑淡出，阅后即焚无需擦除！",
+                        WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        435, 418, 365, 84, hwnd, nullptr, g_instance, nullptr);
+
+        // ==========================================
+        // BOTTOM ACTION BUTTONS
+        // ==========================================
         CreateWindowExW(0, L"BUTTON", L"恢复默认设置",
                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                        15, 738, 140, 32, hwnd, (HMENU)(INT_PTR)IDC_BTN_RESET, g_instance, nullptr);
+                        15, 552, 140, 32, hwnd, (HMENU)(INT_PTR)IDC_BTN_RESET, g_instance, nullptr);
 
         CreateWindowExW(0, L"BUTTON", L"保存并关闭",
                         WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
-                        315, 738, 140, 32, hwnd, (HMENU)(INT_PTR)IDC_BTN_SAVE, g_instance, nullptr);
+                        670, 552, 140, 32, hwnd, (HMENU)(INT_PTR)IDC_BTN_SAVE, g_instance, nullptr);
 
         // Apply modern font to all child controls
         EnumChildWindows(hwnd, [](HWND hChild, LPARAM lParam) -> BOOL {
@@ -1239,6 +1612,8 @@ LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         else if (dis->CtlID == IDC_BTN_COLOR_MID) fillCol = g_config.middleColor;
         else if (dis->CtlID == IDC_BTN_COLOR_AMBIENT) fillCol = g_config.ambientColor;
         else if (dis->CtlID == IDC_BTN_COLOR_TRAIL) fillCol = g_config.trailColor;
+        else if (dis->CtlID == IDC_BTN_COLOR_INK) fillCol = g_config.inkColor;
+        else if (dis->CtlID == IDC_BTN_COLOR_ARROW) fillCol = g_config.arrowColor;
 
         HBRUSH brush = CreateSolidBrush(fillCol);
         FillRect(dis->hDC, &dis->rcItem, brush);
@@ -1292,6 +1667,11 @@ LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if (hTrack == GetDlgItem(hwnd, IDC_TRK_TRAIL_ALPHA)) {
             g_config.trailAlphaPercent = val;
             g_config.trailAlpha = static_cast<int>(255.0f * (val / 100.0f));
+        } else if (hTrack == GetDlgItem(hwnd, IDC_TRK_INK_WIDTH)) {
+            g_config.inkWidth = val;
+            g_config.arrowWidth = val;
+        } else if (hTrack == GetDlgItem(hwnd, IDC_TRK_ANNOTATION_HOLD)) {
+            g_config.annotationHoldMs = val;
         }
         updateSettingsLabels(hwnd);
         return 0;
@@ -1345,6 +1725,20 @@ LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             return 0;
         }
 
+        if (id == IDC_BTN_COLOR_INK) {
+            if (pickColor(hwnd, g_config.inkColor)) {
+                InvalidateRect(GetDlgItem(hwnd, IDC_BTN_COLOR_INK), nullptr, TRUE);
+            }
+            return 0;
+        }
+
+        if (id == IDC_BTN_COLOR_ARROW) {
+            if (pickColor(hwnd, g_config.arrowColor)) {
+                InvalidateRect(GetDlgItem(hwnd, IDC_BTN_COLOR_ARROW), nullptr, TRUE);
+            }
+            return 0;
+        }
+
         if (id == IDC_CHK_CENTERDOT) {
             g_config.centerDot = (IsDlgButtonChecked(hwnd, IDC_CHK_CENTERDOT) == BST_CHECKED);
             return 0;
@@ -1363,19 +1757,36 @@ LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             return 0;
         }
 
+        if (id == IDC_CHK_ANNOTATION) {
+            g_config.annotationEnabled = (IsDlgButtonChecked(hwnd, IDC_CHK_ANNOTATION) == BST_CHECKED);
+            if (!g_config.annotationEnabled) {
+                g_annotations.clear();
+                g_isDrawingInk = false;
+                g_isDrawingArrow = false;
+            }
+            return 0;
+        }
+
         if (id == IDC_BTN_RESET) {
             applyPreset(PRESET_WACOM);
             g_config.leftColor = RGB(232, 65, 82);
             g_config.rightColor = RGB(41, 128, 245);
             g_config.middleColor = RGB(245, 166, 35);
             g_config.ambientColor = RGB(145, 145, 145);
-            g_config.ambientBand = 13;
+            g_config.ambientBand = 2;
+            g_config.ambientThickness = 2;
             g_config.trailEnabled = true;
             g_config.trailColor = RGB(41, 128, 245);
             g_config.trailDurationMs = 380;
             g_config.trailWidth = 8;
             g_config.trailAlphaPercent = 80;
             g_config.trailAlpha = static_cast<int>(255.0f * 0.80f);
+            g_config.annotationEnabled = true;
+            g_config.inkColor = RGB(255, 68, 68);
+            g_config.inkWidth = 6;
+            g_config.arrowColor = RGB(255, 140, 0);
+            g_config.arrowWidth = 6;
+            g_config.annotationHoldMs = 2200;
             syncSettingsControls(hwnd);
             return 0;
         }
@@ -1433,8 +1844,8 @@ void openSettingsWindow() {
         s_settingsClassRegistered = true;
     }
 
-    const int w = 485;
-    const int h = 825;
+    const int w = 840;
+    const int h = 635;
     const int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
     const int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
 
@@ -1505,8 +1916,20 @@ LRESULT CALLBACK overlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     g_trailPoints.end());
             }
 
+            // Prune expired annotations
+            if (!g_annotations.empty()) {
+                const double nowMs = getHighPrecisionMs();
+                g_annotations.erase(
+                    std::remove_if(g_annotations.begin(), g_annotations.end(),
+                        [nowMs](const AnnotationStroke& s) {
+                            if (s.isDrawing) return false;
+                            return (nowMs - s.releasedAt) > (s.holdMs + s.fadeMs);
+                        }),
+                    g_annotations.end());
+            }
+
             static bool s_wasIdle = false;
-            const bool isIdle = g_ripples.empty() && g_trailPoints.empty() && !g_config.ambientRipple;
+            const bool isIdle = g_ripples.empty() && g_trailPoints.empty() && g_annotations.empty() && !g_config.ambientRipple;
             if (isIdle) {
                 if (!s_wasIdle) {
                     renderOverlay(hwnd);
@@ -1675,8 +2098,13 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
     g_mouseHook = SetWindowsHookEx(WH_MOUSE_LL, lowLevelMouseProc, hInstance, 0);
+    g_kbdHook   = SetWindowsHookEx(WH_KEYBOARD_LL, lowLevelKeyboardProc, hInstance, 0);
     if (!g_mouseHook) {
         MessageBox(nullptr, L"Could not install mouse hook.", L"Mouse Ripple", MB_ICONERROR);
+        if (g_kbdHook) {
+            UnhookWindowsHookEx(g_kbdHook);
+            g_kbdHook = nullptr;
+        }
         DestroyWindow(g_overlay);
         GdiplusShutdown(g_gdiplusToken);
         if (hMutex) CloseHandle(hMutex);
@@ -1699,6 +2127,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     if (g_mouseHook) {
         UnhookWindowsHookEx(g_mouseHook);
         g_mouseHook = nullptr;
+    }
+    if (g_kbdHook) {
+        UnhookWindowsHookEx(g_kbdHook);
+        g_kbdHook = nullptr;
     }
     timeEndPeriod(1);
     GdiplusShutdown(g_gdiplusToken);

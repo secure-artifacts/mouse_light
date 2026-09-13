@@ -707,19 +707,33 @@ void drawAnnotationInk(Graphics& g, const AnnotationStroke& stroke, double nowMs
         return;
     }
 
+    // 3-point Gaussian smoothing to filter mouse coordinate quantization
+    std::vector<PointF> smoothPts;
+    smoothPts.reserve(pts.size());
+    smoothPts.push_back(pts.front());
+    for (size_t i = 1; i + 1 < pts.size(); ++i) {
+        float sx = 0.25f * pts[i - 1].X + 0.5f * pts[i].X + 0.25f * pts[i + 1].X;
+        float sy = 0.25f * pts[i - 1].Y + 0.5f * pts[i].Y + 0.25f * pts[i + 1].Y;
+        smoothPts.emplace_back(sx, sy);
+    }
+    smoothPts.push_back(pts.back());
+
+    GraphicsPath path;
+    path.AddLines(smoothPts.data(), static_cast<INT>(smoothPts.size()));
+
     // 1. Soft dark drop shadow pass (ensures high contrast on any background)
     Pen shadowPen(Color(alphaByte(alpha * 85.0f), 0, 0, 0), stroke.width + 3.0f);
     shadowPen.SetStartCap(LineCapRound);
     shadowPen.SetEndCap(LineCapRound);
     shadowPen.SetLineJoin(LineJoinRound);
-    g.DrawCurve(&shadowPen, pts.data(), static_cast<INT>(pts.size()), 0.5f);
+    g.DrawPath(&shadowPen, &path);
 
     // 2. Vibrant core ink pass
     Pen corePen(Color(alphaByte(alpha * 250.0f), r, gg, b), stroke.width);
     corePen.SetStartCap(LineCapRound);
     corePen.SetEndCap(LineCapRound);
     corePen.SetLineJoin(LineJoinRound);
-    g.DrawCurve(&corePen, pts.data(), static_cast<INT>(pts.size()), 0.5f);
+    g.DrawPath(&corePen, &path);
 }
 
 void drawQuickArrow(Graphics& g, const AnnotationStroke& stroke, double nowMs, int originX, int originY) {
@@ -1049,7 +1063,6 @@ LRESULT CALLBACK lowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam) {
                 s.holdMs = static_cast<float>(g_config.annotationHoldMs);
                 s.fadeMs = 800.0f;
                 g_annotations.push_back(s);
-                renderOverlay(g_overlay);
                 return 1; // Intercept: do not click underlying apps or desktop
             }
 
@@ -1067,63 +1080,69 @@ LRESULT CALLBACK lowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam) {
                 s.holdMs = static_cast<float>(g_config.annotationHoldMs);
                 s.fadeMs = 800.0f;
                 g_annotations.push_back(s);
-                renderOverlay(g_overlay);
                 return 1; // Intercept: do not show context menu
             }
 
             // 3. Mouse move while drawing
+            // CRITICAL: NEVER return 1 on WM_MOUSEMOVE! Returning 1 freezes the hardware cursor!
+            // NEVER call heavy renderOverlay synchronously inside low-level hook! WM_TIMER renders at 83 FPS!
             if (wParam == WM_MOUSEMOVE) {
-                if (g_isDrawingInk && !g_annotations.empty()) {
-                    auto& s = g_annotations.back();
-                    if (s.points.empty()) {
-                        s.points.push_back(info->pt);
-                        renderOverlay(g_overlay);
-                    } else {
-                        const auto& last = s.points.back();
-                        const int dx = info->pt.x - last.x;
-                        const int dy = info->pt.y - last.y;
-                        if (dx * dx + dy * dy >= 4) { // At least 2px move
-                            s.points.push_back(info->pt);
-                            renderOverlay(g_overlay);
+                if (g_isDrawingInk) {
+                    for (auto it = g_annotations.rbegin(); it != g_annotations.rend(); ++it) {
+                        if (it->isDrawing && it->type == ANNOTATION_INK) {
+                            if (it->points.empty()) {
+                                it->points.push_back(info->pt);
+                            } else {
+                                const auto& last = it->points.back();
+                                const int dx = info->pt.x - last.x;
+                                const int dy = info->pt.y - last.y;
+                                if (dx * dx + dy * dy >= 9) { // At least 3px move for clean sampling
+                                    it->points.push_back(info->pt);
+                                }
+                            }
+                            break;
                         }
                     }
-                    return 1; // Intercept while drawing ink
-                }
-
-                if (g_isDrawingArrow && !g_annotations.empty()) {
-                    auto& s = g_annotations.back();
-                    s.endPt = info->pt;
-                    renderOverlay(g_overlay);
-                    return 1; // Intercept while drawing arrow
+                } else if (g_isDrawingArrow) {
+                    for (auto it = g_annotations.rbegin(); it != g_annotations.rend(); ++it) {
+                        if (it->isDrawing && it->type == ANNOTATION_ARROW) {
+                            it->endPt = info->pt;
+                            break;
+                        }
+                    }
                 }
             }
 
             // 4. Mouse button up finishes drawing and triggers auto-fade countdown
             if (wParam == WM_LBUTTONUP && g_isDrawingInk) {
                 g_isDrawingInk = false;
-                if (!g_annotations.empty()) {
-                    auto& s = g_annotations.back();
-                    s.isDrawing = false;
-                    s.releasedAt = getHighPrecisionMs();
+                const double nowMs = getHighPrecisionMs();
+                for (auto it = g_annotations.rbegin(); it != g_annotations.rend(); ++it) {
+                    if (it->isDrawing && it->type == ANNOTATION_INK) {
+                        it->isDrawing = false;
+                        it->releasedAt = nowMs;
+                        break;
+                    }
                 }
-                renderOverlay(g_overlay);
-                return 1; // Intercept
+                return 1; // Intercept button up
             }
 
             if (wParam == WM_RBUTTONUP && g_isDrawingArrow) {
                 g_isDrawingArrow = false;
-                if (!g_annotations.empty()) {
-                    auto& s = g_annotations.back();
-                    s.isDrawing = false;
-                    s.releasedAt = getHighPrecisionMs();
+                const double nowMs = getHighPrecisionMs();
+                for (auto it = g_annotations.rbegin(); it != g_annotations.rend(); ++it) {
+                    if (it->isDrawing && it->type == ANNOTATION_ARROW) {
+                        it->isDrawing = false;
+                        it->releasedAt = nowMs;
+                        break;
+                    }
                 }
-                renderOverlay(g_overlay);
-                return 1; // Intercept
+                return 1; // Intercept right button up
             }
         }
 
         if (wParam == WM_MOUSEMOVE) {
-            if (g_config.trailEnabled) {
+            if (g_config.trailEnabled && !g_isDrawingInk && !g_isDrawingArrow) {
                 const double nowMs = getHighPrecisionMs();
                 if (g_trailPoints.empty()) {
                     g_trailPoints.push_back({info->pt, nowMs});

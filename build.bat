@@ -26,7 +26,17 @@ if errorlevel 1 (
 )
 
 taskkill /f /im MouseRipple.exe >nul 2>nul
-cl /nologo /utf-8 /EHsc /O2 /std:c++17 /DUNICODE /D_UNICODE MouseRipple.cpp /link /SUBSYSTEM:WINDOWS gdiplus.lib user32.lib gdi32.lib shell32.lib comctl32.lib comdlg32.lib advapi32.lib /OUT:MouseRipple.exe
+taskkill /f /im mouse_light.exe >nul 2>nul
+taskkill /f /im "mouse_light (2).exe" >nul 2>nul
+if exist MouseRipple.rc (
+  echo [MouseRipple] Compiling resources...
+  rc /nologo /fo MouseRipple.res MouseRipple.rc
+)
+
+set "RES_FILE="
+if exist MouseRipple.res set "RES_FILE=MouseRipple.res"
+
+cl /nologo /utf-8 /EHsc /O2 /std:c++17 /DUNICODE /D_UNICODE MouseRipple.cpp !RES_FILE! /link /SUBSYSTEM:WINDOWS gdiplus.lib user32.lib gdi32.lib shell32.lib comctl32.lib comdlg32.lib advapi32.lib winmm.lib /OUT:MouseRipple.exe
 if errorlevel 1 (
   echo.
   echo Build failed.
@@ -35,6 +45,7 @@ if errorlevel 1 (
 )
 
 if exist MouseRipple.obj del MouseRipple.obj
+if exist MouseRipple.res del MouseRipple.res
 
 echo.
 echo Built successfully: MouseRipple.exe

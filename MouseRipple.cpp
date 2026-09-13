@@ -1,4 +1,4 @@
-﻿#ifndef UNICODE
+#ifndef UNICODE
 #define UNICODE
 #endif
 #ifndef _UNICODE
@@ -11,11 +11,13 @@
 #include <shellapi.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <timeapi.h>
 #include <vector>
 #include <algorithm>
 #include <cmath>
 #include <string>
 #include <sstream>
+#include "resource.h"
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "user32.lib")
@@ -24,6 +26,7 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "winmm.lib")
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -33,7 +36,7 @@ namespace {
 
 // Message IDs
 constexpr UINT_PTR kFrameTimerId = 1;
-constexpr UINT kFrameMs = 16;               // ~60 FPS
+constexpr UINT kFrameMs = 12;               // ~83 FPS (极速丝滑高刷新，配合 timeBeginPeriod(1))
 constexpr UINT WM_RIPPLE_CLICK = WM_APP + 1;
 constexpr UINT WM_TRAYICON     = WM_APP + 2;
 
@@ -124,8 +127,19 @@ struct Ripple {
 
 struct TrailPoint {
     POINT screenPt{};
-    ULONGLONG timeMs = 0;
+    double timeMs = 0.0;
 };
+
+inline double getHighPrecisionMs() {
+    static const double invFreq = []() {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return 1000.0 / static_cast<double>(f.QuadPart);
+    }();
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return static_cast<double>(counter.QuadPart) * invFreq;
+}
 
 HINSTANCE g_instance = nullptr;
 HWND g_overlay = nullptr;
@@ -356,142 +370,245 @@ void drawSoftToroidalWave(Graphics& g, float cx, float cy, float rCrest, float h
 }
 
 // -------------------------------------------------------------
-// Calligraphic Ink Ribbon Trail (水墨流线拖尾：单体闭合曲面流，彻底杜绝阶梯/串珠/断折)
+// Calligraphic Ink Ribbon Trail (水墨流线拖尾：向心样条 + 物理弧长锥度 + Alpha渐隐 + 转角防自交)
 // -------------------------------------------------------------
 void drawSmoothInkRibbon(Graphics& g, const std::vector<TrailPoint>& points, float totalDurationMs,
-                         float baseWidth, int baseAlpha, COLORREF color, int vx, int vy, ULONGLONG now) {
-    const int n = static_cast<int>(points.size());
-    if (n < 2) return;
+                         float baseWidth, int baseAlpha, COLORREF color, int vx, int vy, double nowMs) {
+    const int nRaw = static_cast<int>(points.size());
+    if (nRaw < 2) return;
 
     const BYTE r = GetRValue(color);
     const BYTE gg = GetGValue(color);
     const BYTE b = GetBValue(color);
 
-    // 1. 坐标转换与点位存活度计算
-    struct PtT { float x, y; float life; };
-    std::vector<PtT> rawPts(n);
-    for (int i = 0; i < n; ++i) {
-        rawPts[i].x = static_cast<float>(points[i].screenPt.x - vx);
-        rawPts[i].y = static_cast<float>(points[i].screenPt.y - vy);
-        float elapsed = static_cast<float>(now > points[i].timeMs ? now - points[i].timeMs : 0);
-        rawPts[i].life = clamp01(1.0f - elapsed / totalDurationMs);
+    // 1. 提取样本并计算高精度寿命 (life: 0.0 ~ 1.0)
+    struct SamplePt {
+        float x, y;
+        float life;
+    };
+    std::vector<SamplePt> rawPts;
+    rawPts.reserve(nRaw);
+
+    for (int i = 0; i < nRaw; ++i) {
+        float elapsed = static_cast<float>(nowMs > points[i].timeMs ? nowMs - points[i].timeMs : 0.0);
+        float life = clamp01(1.0f - elapsed / totalDurationMs);
+        if (life <= 0.001f && i + 2 < nRaw) {
+            continue; // 已完全过期的末尾历史点提前丢弃
+        }
+        SamplePt pt;
+        pt.x = static_cast<float>(points[i].screenPt.x - vx);
+        pt.y = static_cast<float>(points[i].screenPt.y - vy);
+        pt.life = life;
+        rawPts.push_back(pt);
     }
 
-    // 2. 向心样条曲线插值（自适应步长 + 端点自然切线外推，杜绝快速划动末端僵直折线）
-    std::vector<PtT> spline;
-    spline.reserve(n * 40);
+    const int n = static_cast<int>(rawPts.size());
+    if (n < 2) return;
+
+    // 2. 轨迹坐标轻度滤波（滤除鼠标硬件整数坐标产生的 1px 阶梯锯齿，同时保持笔头零延迟精准）
+    std::vector<SamplePt> ctrlPts = rawPts;
+    if (n >= 3) {
+        for (int i = 1; i < n - 1; ++i) {
+            ctrlPts[i].x = 0.2f * rawPts[i - 1].x + 0.6f * rawPts[i].x + 0.2f * rawPts[i + 1].x;
+            ctrlPts[i].y = 0.2f * rawPts[i - 1].y + 0.6f * rawPts[i].y + 0.2f * rawPts[i + 1].y;
+        }
+    }
+
+    // 3. 严格向心 Catmull-Rom 样条插值（Centripetal Spline: alpha = 0.5）
+    // 数学上保证无局部自交环绕、无超调起伏、无波浪形凸起
+    std::vector<SamplePt> spline;
+    spline.reserve(n * 35);
+
+    auto getKnot = [](const SamplePt& pA, const SamplePt& pB, float tPrev) -> float {
+        float dx = pB.x - pA.x;
+        float dy = pB.y - pA.y;
+        float dist = std::hypot(dx, dy);
+        return tPrev + std::pow((std::max)(dist, 0.001f), 0.5f); // alpha = 0.5 向心参数化
+    };
 
     for (int i = 0; i < n - 1; ++i) {
-        PtT p0, p1, p2, p3;
-        p1 = rawPts[i];
-        p2 = rawPts[i + 1];
+        SamplePt p0, p1, p2, p3;
+        p1 = ctrlPts[i];
+        p2 = ctrlPts[i + 1];
 
-        // 端点自然外推，避免一头一尾切线被强制锁定为直弦
+        // 端点平滑自然镜像
         if (i == 0) {
             p0.x = p1.x - (p2.x - p1.x);
             p0.y = p1.y - (p2.y - p1.y);
-            p0.life = clamp01(p1.life + (p1.life - p2.life));
+            p0.life = clamp01(p1.life - (p2.life - p1.life));
         } else {
-            p0 = rawPts[i - 1];
+            p0 = ctrlPts[i - 1];
         }
 
         if (i + 2 < n) {
-            p3 = rawPts[i + 2];
+            p3 = ctrlPts[i + 2];
         } else {
             p3.x = p2.x + (p2.x - p1.x);
             p3.y = p2.y + (p2.y - p1.y);
-            p3.life = clamp01(p2.life - (p1.life - p2.life));
+            p3.life = clamp01(p2.life + (p2.life - p1.life));
         }
 
-        const float dist = std::hypot(p2.x - p1.x, p2.y - p1.y);
-        const int steps = (std::max)(4, (std::min)(50, static_cast<int>(dist / 1.5f)));
+        float t0 = 0.0f;
+        float t1 = getKnot(p0, p1, t0);
+        float t2 = getKnot(p1, p2, t1);
+        float t3 = getKnot(p2, p3, t2);
+
+        float d10 = (std::max)(t1 - t0, 0.0001f);
+        float d21 = (std::max)(t2 - t1, 0.0001f);
+        float d32 = (std::max)(t3 - t2, 0.0001f);
+        float d20 = (std::max)(t2 - t0, 0.0001f);
+        float d31 = (std::max)(t3 - t1, 0.0001f);
+
+        const float segDist = std::hypot(p2.x - p1.x, p2.y - p1.y);
+        const int steps = (std::max)(3, (std::min)(35, static_cast<int>(std::ceil(segDist / 1.8f))));
 
         for (int s = 0; s < steps; ++s) {
             const float u = static_cast<float>(s) / static_cast<float>(steps);
-            const float u2 = u * u;
-            const float u3 = u2 * u;
+            const float t = t1 + u * (t2 - t1);
 
-            const float x = 0.5f * ((2.0f * p1.x) +
-                                  (-p0.x + p2.x) * u +
-                                  (2.0f * p0.x - 5.0f * p1.x + 4.0f * p2.x - p3.x) * u2 +
-                                  (-p0.x + 3.0f * p1.x - 3.0f * p2.x + p3.x) * u3);
+            float a1_x = ((t1 - t) * p0.x + (t - t0) * p1.x) / d10;
+            float a1_y = ((t1 - t) * p0.y + (t - t0) * p1.y) / d10;
+            float a1_l = ((t1 - t) * p0.life + (t - t0) * p1.life) / d10;
 
-            const float y = 0.5f * ((2.0f * p1.y) +
-                                  (-p0.y + p2.y) * u +
-                                  (2.0f * p0.y - 5.0f * p1.y + 4.0f * p2.y - p3.y) * u2 +
-                                  (-p0.y + 3.0f * p1.y - 3.0f * p2.y + p3.y) * u3);
+            float a2_x = ((t2 - t) * p1.x + (t - t1) * p2.x) / d21;
+            float a2_y = ((t2 - t) * p1.y + (t - t1) * p2.y) / d21;
+            float a2_l = ((t2 - t) * p1.life + (t - t1) * p2.life) / d21;
 
-            const float life = p1.life + (p2.life - p1.life) * u;
-            spline.push_back({x, y, clamp01(life)});
+            float a3_x = ((t3 - t) * p2.x + (t - t2) * p3.x) / d32;
+            float a3_y = ((t3 - t) * p2.y + (t - t2) * p3.y) / d32;
+            float a3_l = ((t3 - t) * p2.life + (t - t2) * p3.life) / d32;
+
+            float b1_x = ((t2 - t) * a1_x + (t - t0) * a2_x) / d20;
+            float b1_y = ((t2 - t) * a1_y + (t - t0) * a2_y) / d20;
+            float b1_l = ((t2 - t) * a1_l + (t - t0) * a2_l) / d20;
+
+            float b2_x = ((t3 - t) * a2_x + (t - t1) * a3_x) / d31;
+            float b2_y = ((t3 - t) * a2_y + (t - t1) * a3_y) / d31;
+            float b2_l = ((t3 - t) * a2_l + (t - t1) * a3_l) / d31;
+
+            float cx = ((t2 - t) * b1_x + (t - t1) * b2_x) / d21;
+            float cy = ((t2 - t) * b1_y + (t - t1) * b2_y) / d21;
+            float cl = ((t2 - t) * b1_l + (t - t1) * b2_l) / d21;
+
+            spline.push_back({cx, cy, clamp01(cl)});
         }
     }
-    spline.push_back(rawPts.back());
+    spline.push_back(ctrlPts.back());
 
     const int m = static_cast<int>(spline.size());
     if (m < 2) return;
 
-    // 3. 计算连续无阶梯法向轮廓左右边界（宽度纯数学无级衰减，完全消灭阶梯跳变与毛发细尾）
+    // 4. 计算沿轨迹物理累积弧长（Cumulative Arc Length）
+    std::vector<float> arcLen(m, 0.0f);
+    float totalLen = 0.0f;
+    for (int i = 1; i < m; ++i) {
+        float d = std::hypot(spline[i].x - spline[i - 1].x, spline[i].y - spline[i - 1].y);
+        totalLen += d;
+        arcLen[i] = totalLen;
+    }
+    if (totalLen < 1.0f) return;
+
+    // 5. 计算切线方向与法线向量（带 3 点平滑，彻底消除法线微扰抖动）
+    std::vector<PointF> tangents(m);
+    for (int i = 0; i < m; ++i) {
+        float tx = 0.0f, ty = 0.0f;
+        if (i == 0) {
+            tx = spline[1].x - spline[0].x;
+            ty = spline[1].y - spline[0].y;
+        } else if (i == m - 1) {
+            tx = spline[m - 1].x - spline[m - 2].x;
+            ty = spline[m - 1].y - spline[m - 2].y;
+        } else {
+            tx = spline[i + 1].x - spline[i - 1].x;
+            ty = spline[i + 1].y - spline[i - 1].y;
+        }
+        float len = std::hypot(tx, ty);
+        if (len > 0.0001f) {
+            tangents[i] = PointF(tx / len, ty / len);
+        } else {
+            tangents[i] = (i > 0) ? tangents[i - 1] : PointF(1.0f, 0.0f);
+        }
+    }
+
+    std::vector<PointF> rawNormals(m);
+    for (int i = 0; i < m; ++i) {
+        rawNormals[i] = PointF(-tangents[i].Y, tangents[i].X);
+    }
+
+    std::vector<PointF> normals = rawNormals;
+    if (m >= 3) {
+        for (int i = 1; i < m - 1; ++i) {
+            float nx = 0.25f * rawNormals[i - 1].X + 0.5f * rawNormals[i].X + 0.25f * rawNormals[i + 1].X;
+            float ny = 0.25f * rawNormals[i - 1].Y + 0.5f * rawNormals[i].Y + 0.25f * rawNormals[i + 1].Y;
+            float len = std::hypot(nx, ny);
+            if (len > 0.0001f) {
+                normals[i] = PointF(nx / len, ny / len);
+            }
+        }
+    }
+
+    // 6. 物理弧长锥度与转角防自交折痕保护（生成左右边界）
     std::vector<PointF> leftEdge(m);
     std::vector<PointF> rightEdge(m);
+    std::vector<float> segmentAlpha(m, 0.0f);
 
     for (int i = 0; i < m; ++i) {
-        float dx = 0.0f, dy = 0.0f;
-        if (i == 0) {
-            dx = spline[1].x - spline[0].x;
-            dy = spline[1].y - spline[0].y;
-        } else if (i == m - 1) {
-            dx = spline[m - 1].x - spline[m - 2].x;
-            dy = spline[m - 1].y - spline[m - 2].y;
-        } else {
-            dx = spline[i + 1].x - spline[i - 1].x;
-            dy = spline[i + 1].y - spline[i - 1].y;
+        const float u = arcLen[i] / totalLen; // 0.0 (尾端) ~ 1.0 (笔尖)
+        const float life = spline[i].life;
+
+        // 弧长空间平滑过渡 (sin 缓动使笔尖饱满、尾梢纯数学平滑收窄)
+        const float geomTaper = std::sin(u * 1.5707963f);
+        float hw = (baseWidth * 0.5f) * geomTaper * std::sqrt(life);
+        if (hw < 0.35f) hw = 0.35f;
+
+        // 转角曲率自适应保护：锐角折返时平滑收敛线宽，杜绝内侧自交突起与外侧鸟嘴刺角
+        if (i > 0 && i < m - 1) {
+            float dot = tangents[i - 1].X * tangents[i + 1].X + tangents[i - 1].Y * tangents[i + 1].Y;
+            if (dot < 0.7f) {
+                float cornerScale = 0.45f + 0.55f * (0.5f * (dot + 1.0f));
+                hw *= (std::max)(0.4f, cornerScale);
+            }
         }
 
-        const float len = std::hypot(dx, dy);
-        float nx = 0.0f, ny = 0.0f;
-        if (len > 0.001f) {
-            nx = -dy / len;
-            ny = dx / len;
-        }
+        leftEdge[i]  = PointF(spline[i].x + normals[i].X * hw, spline[i].y + normals[i].Y * hw);
+        rightEdge[i] = PointF(spline[i].x - normals[i].X * hw, spline[i].y - normals[i].Y * hw);
 
-        // 半线宽随存活度无级衰减：尾部收于 0.3px 锋尖，头部丰满
-        float hw = (baseWidth * 0.5f) * std::pow(spline[i].life, 0.70f);
-        if (hw < 0.3f) hw = 0.3f;
-
-        leftEdge[i]  = PointF(spline[i].x + nx * hw, spline[i].y + ny * hw);
-        rightEdge[i] = PointF(spline[i].x - nx * hw, spline[i].y - ny * hw);
+        // Alpha 沿线平滑衰减：尾部归零羽化淡出，头部饱满
+        float localA = static_cast<float>(baseAlpha) * std::pow(u, 1.25f) * std::pow(life, 0.8f);
+        segmentAlpha[i] = localA;
     }
 
-    // 4. 构建单体闭合曲面图形路径（FillModeWinding，自相交时平滑实体融合，无孔洞）
-    GraphicsPath path;
-    path.SetFillMode(FillModeWinding);
+    // 7. 微元带状网格渲染（Micro-Quads Ribbon Strips，实现由实到虚的渐隐与无缝抗锯齿融合）
+    for (int i = 0; i < m - 1; ++i) {
+        float avgA = 0.5f * (segmentAlpha[i] + segmentAlpha[i + 1]);
+        if (avgA < 1.0f) continue;
 
-    // 左边缘从尾到头
-    path.AddLines(leftEdge.data(), m);
+        BYTE a = alphaByte(avgA);
+        SolidBrush brush(Color(a, r, gg, b));
 
-    // 头部圆润弧线接合（笔尖）
+        // 沿切线方向微重叠 0.6px，完全消除 GDI+ 邻接多边形亚像素缝隙
+        const float overlap = 0.6f;
+        const float ox = tangents[i + 1].X * overlap;
+        const float oy = tangents[i + 1].Y * overlap;
+
+        PointF quad[4] = {
+            leftEdge[i],
+            PointF(leftEdge[i + 1].X + ox, leftEdge[i + 1].Y + oy),
+            PointF(rightEdge[i + 1].X + ox, rightEdge[i + 1].Y + oy),
+            rightEdge[i]
+        };
+
+        g.FillPolygon(&brush, quad, 4);
+    }
+
+    // 8. 笔尖顺滑圆帽（Head Cap，消除 180° 反向翻转倒钩）
     const auto& headPt = spline.back();
-    const float headR = (baseWidth * 0.5f) * std::pow(headPt.life, 0.70f);
-    if (headR > 0.5f) {
-        float angleL = std::atan2(leftEdge[m - 1].Y - headPt.y, leftEdge[m - 1].X - headPt.x) * 180.0f / 3.14159265f;
-        path.AddArc(headPt.x - headR, headPt.y - headR, headR * 2.0f, headR * 2.0f, angleL, -180.0f);
+    float headHw = (baseWidth * 0.5f) * std::sqrt(headPt.life);
+    float headA = segmentAlpha.back();
+    if (headHw > 0.5f && headA > 1.0f) {
+        SolidBrush headBrush(Color(alphaByte(headA), r, gg, b));
+        g.FillEllipse(&headBrush, headPt.x - headHw, headPt.y - headHw, headHw * 2.0f, headHw * 2.0f);
     }
-
-    // 右边缘从头回尾
-    std::vector<PointF> revRight(m);
-    for (int i = 0; i < m; ++i) revRight[i] = rightEdge[m - 1 - i];
-    path.AddLines(revRight.data(), m);
-
-    // 闭合路径至尾端锋尖
-    path.CloseFigure();
-
-    // 5. 单次渲染光栅化（零阶梯跳变、零内部端帽重叠、零串珠、浑然一体）
-    const float effectiveAlpha = static_cast<float>(baseAlpha) * std::pow(headPt.life, 0.35f);
-    SolidBrush brush(Color(alphaByte(effectiveAlpha), r, gg, b));
-    g.FillPath(&brush, &path);
-
-    Pen contourPen(Color(alphaByte(effectiveAlpha), r, gg, b), 1.0f);
-    g.DrawPath(&contourPen, &path);
 }
 
 // -------------------------------------------------------------
@@ -654,6 +771,7 @@ void renderOverlay(HWND hwnd) {
         graphics.SetPixelOffsetMode(PixelOffsetModeHighQuality);
         graphics.SetCompositingMode(CompositingModeSourceOver);
 
+        const double nowMs = getHighPrecisionMs();
         const ULONGLONG now = GetTickCount64();
 
         // 1. Draw ink ribbon trail if enabled
@@ -663,7 +781,7 @@ void renderOverlay(HWND hwnd) {
                                 static_cast<float>(g_config.trailWidth),
                                 g_config.trailAlpha,
                                 g_config.trailColor,
-                                g_virtualX, g_virtualY, now);
+                                g_virtualX, g_virtualY, nowMs);
         }
 
         // 2. Draw ambient continuous gradient water ripple if enabled
@@ -710,16 +828,16 @@ LRESULT CALLBACK lowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam) {
         if (wParam == WM_MOUSEMOVE) {
             if (g_config.trailEnabled) {
                 const auto* info = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
-                const ULONGLONG now = GetTickCount64();
+                const double nowMs = getHighPrecisionMs();
                 if (g_trailPoints.empty()) {
-                    g_trailPoints.push_back({info->pt, now});
+                    g_trailPoints.push_back({info->pt, nowMs});
                 } else {
                     const auto& last = g_trailPoints.back();
                     const int dx = info->pt.x - last.screenPt.x;
                     const int dy = info->pt.y - last.screenPt.y;
-                    if (dx * dx + dy * dy >= 4) { // 过滤微颤，至少位移 2px
-                        g_trailPoints.push_back({info->pt, now});
-                        if (g_trailPoints.size() > 250) {
+                    if (dx * dx + dy * dy >= 2) { // 位移至少 ~1.4px，精确保留平滑弧线同时过滤原地重复事件
+                        g_trailPoints.push_back({info->pt, nowMs});
+                        if (g_trailPoints.size() > 300) {
                             g_trailPoints.erase(g_trailPoints.begin());
                         }
                     }
@@ -748,7 +866,9 @@ void addTrayIcon(HWND hwnd) {
     nid.uID = 1;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_INFO;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    HICON hCustomIcon = (HICON)LoadImageW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                          GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+    nid.hIcon = hCustomIcon ? hCustomIcon : LoadIcon(nullptr, IDI_APPLICATION);
     lstrcpynW(nid.szTip, L"MouseRipple - 鼠标水波纹 (双击打开设置)", ARRAYSIZE(nid.szTip));
     lstrcpynW(nid.szInfoTitle, L"MouseRipple 水波纹已运行", ARRAYSIZE(nid.szInfoTitle));
     lstrcpynW(nid.szInfo, L"鼠标水波纹已生效。双击任务栏托盘图标可调整设置。", ARRAYSIZE(nid.szInfo));
@@ -1304,6 +1424,10 @@ void openSettingsWindow() {
         wc.hInstance = g_instance;
         wc.lpszClassName = kSettingsClassName;
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hIcon = (HICON)LoadImageW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                     GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
+        wc.hIconSm = (HICON)LoadImageW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
         RegisterClassEx(&wc);
         s_settingsClassRegistered = true;
@@ -1323,6 +1447,12 @@ void openSettingsWindow() {
         nullptr, nullptr, g_instance, nullptr);
 
     if (g_settingsWnd) {
+        HICON hBig = (HICON)LoadImageW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
+        HICON hSm  = (HICON)LoadImageW(g_instance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+        if (hBig) SendMessageW(g_settingsWnd, WM_SETICON, ICON_BIG, (LPARAM)hBig);
+        if (hSm)  SendMessageW(g_settingsWnd, WM_SETICON, ICON_SMALL, (LPARAM)hSm);
         ShowWindow(g_settingsWnd, SW_SHOW);
         UpdateWindow(g_settingsWnd);
         SetWindowPos(g_settingsWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
@@ -1365,11 +1495,12 @@ LRESULT CALLBACK overlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             // Prune expired trail points
             if (!g_trailPoints.empty()) {
-                const ULONGLONG trailMaxAge = static_cast<ULONGLONG>(g_config.trailDurationMs);
+                const double nowMs = getHighPrecisionMs();
+                const double trailMaxAge = static_cast<double>(g_config.trailDurationMs);
                 g_trailPoints.erase(
                     std::remove_if(g_trailPoints.begin(), g_trailPoints.end(),
-                        [now, trailMaxAge](const TrailPoint& tp) {
-                            return (now - tp.timeMs) > trailMaxAge;
+                        [nowMs, trailMaxAge](const TrailPoint& tp) {
+                            return (nowMs - tp.timeMs) > trailMaxAge;
                         }),
                     g_trailPoints.end());
             }
@@ -1499,6 +1630,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     // Load user configuration
     loadConfig();
 
+    timeBeginPeriod(1);
+
     GdiplusStartupInput gdiplusStartupInput;
     if (GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr) != Ok) {
         MessageBox(nullptr, L"Could not start GDI+.", L"Mouse Ripple", MB_ICONERROR);
@@ -1513,6 +1646,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     wc.hInstance = hInstance;
     wc.lpszClassName = kClassName;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hIcon = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                 GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
+    wc.hIconSm = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
     RegisterClassEx(&wc);
 
     updateVirtualDesktopMetrics();
@@ -1563,6 +1700,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         UnhookWindowsHookEx(g_mouseHook);
         g_mouseHook = nullptr;
     }
+    timeEndPeriod(1);
     GdiplusShutdown(g_gdiplusToken);
     if (hMutex) CloseHandle(hMutex);
     return static_cast<int>(msg.wParam);

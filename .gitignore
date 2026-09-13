@@ -6,6 +6,7 @@
 *.ilk
 *.exp
 *.lib
+*.res
 *.manifest
 !MouseRipple.exe.manifest
 

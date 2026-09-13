@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -24,12 +25,14 @@ jobs:
         shell: cmd
         run: |
           mkdir dist
-          cl /nologo /utf-8 /EHsc /O2 /std:c++17 /DUNICODE /D_UNICODE MouseRipple.cpp /link /SUBSYSTEM:WINDOWS gdiplus.lib user32.lib gdi32.lib shell32.lib comctl32.lib comdlg32.lib advapi32.lib /OUT:dist\mouse_light.exe
+          rc /nologo /fo MouseRipple.res MouseRipple.rc
+          cl /nologo /utf-8 /EHsc /O2 /std:c++17 /DUNICODE /D_UNICODE MouseRipple.cpp MouseRipple.res /link /SUBSYSTEM:WINDOWS gdiplus.lib user32.lib gdi32.lib shell32.lib comctl32.lib comdlg32.lib advapi32.lib winmm.lib /OUT:dist\mouse_light.exe
+          copy dist\mouse_light.exe dist\MouseRipple.exe
           copy MouseRipple.ini dist\MouseRipple.ini
           copy README.md dist\README.md
           copy LICENSE dist\LICENSE
           cd dist
-          tar -a -c -f mouse_light-windows-x64.zip mouse_light.exe MouseRipple.ini README.md LICENSE
+          tar -a -c -f mouse_light-windows-x64.zip mouse_light.exe MouseRipple.exe MouseRipple.ini README.md LICENSE
           cd ..
 
       - name: Attest Build Provenance
@@ -37,6 +40,7 @@ jobs:
         with:
           subject-path: |
             dist/mouse_light.exe
+            dist/MouseRipple.exe
             dist/mouse_light-windows-x64.zip
 
       - name: Create Release
@@ -44,5 +48,6 @@ jobs:
         with:
           files: |
             dist/mouse_light.exe
+            dist/MouseRipple.exe
             dist/mouse_light-windows-x64.zip
           generate_release_notes: true
